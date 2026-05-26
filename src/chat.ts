@@ -11,6 +11,7 @@ type ChatMessage = {
 
 type AgentAction =
   | { type: "final"; answer: { summary: string; blocks?: Array<{ kind: "text" | "code"; content: string; language?: string }> } }
+  | { type: "plan"; items: Array<{ content: string; status: "pending" | "in_progress" | "completed" }> }
   | { type: "read"; path: string; reason?: string }
   | { type: "write"; path: string; content: string; reason?: string }
   | { type: "edit"; path: string; search: string; replace: string; reason?: string }
@@ -41,11 +42,23 @@ type IntentResult = {
   tools: Array<"read" | "write" | "edit" | "bash">;
 };
 type AgentMode = "answer" | "inspect" | "write";
+type PlanItem = { content: string; status: "pending" | "in_progress" | "completed" };
 
 const C_RESET = "\x1b[0m";
 const C_INPUT = "\x1b[36m";
 const C_OUTPUT = "\x1b[32m";
 const C_META = "\x1b[90m";
+
+function renderPlan(items: PlanItem[]): void {
+  if (items.length === 0) {
+    return;
+  }
+  console.log(`${C_META}plan>${C_RESET}`);
+  for (const item of items) {
+    const mark = item.status === "completed" ? "x" : item.status === "in_progress" ? ">" : " ";
+    console.log(`${C_META}- [${mark}] ${item.content}${C_RESET}`);
+  }
+}
 
 function loadProjectRules(): string {
   const rulesPath = join(process.cwd(), "agents.md");
@@ -249,6 +262,16 @@ function parseAgentAction(raw: string): AgentAction | null {
         },
       };
     }
+    if (obj.type === "plan" && Array.isArray((obj as { items?: unknown }).items)) {
+      const items = (obj as { items: unknown[] }).items
+        .map((item) => item as Partial<PlanItem>)
+        .filter(
+          (item): item is PlanItem =>
+            typeof item.content === "string" &&
+            ["pending", "in_progress", "completed"].includes(String(item.status)),
+        );
+      return { type: "plan", items };
+    }
     if (obj.type === "read" && typeof (obj as { path?: unknown }).path === "string") {
       return { type: "read", path: (obj as { path: string }).path, reason: typeof (obj as { reason?: unknown }).reason === "string" ? (obj as { reason: string }).reason : "" };
     }
@@ -322,7 +345,7 @@ function quotePowerShellArg(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
-function runTool(action: Exclude<AgentAction, { type: "final" }>): Promise<string> {
+function runTool(action: Exclude<AgentAction, { type: "final" | "plan" }>): Promise<string> {
   if (action.type === "read") {
     return Promise.resolve(readFileSync(action.path, "utf8"));
   }
@@ -341,7 +364,7 @@ function runTool(action: Exclude<AgentAction, { type: "final" }>): Promise<strin
   return runCommand(action.command, action.args ?? []);
 }
 
-function describeTool(action: Exclude<AgentAction, { type: "final" }>): string {
+function describeTool(action: Exclude<AgentAction, { type: "final" | "plan" }>): string {
   if (action.type === "read") {
     return `read ${action.path}`;
   }
@@ -409,6 +432,7 @@ async function runAgentTurn(
   spinner?: { stop: () => void; restart: () => void },
 ): Promise<AgentTurnResult> {
   const maxSteps = 8;
+  let plan: PlanItem[] = [];
   const loopMessages: ChatMessage[] = [
     {
       role: "system",
@@ -416,14 +440,16 @@ async function runAgentTurn(
         `本轮意图识别建议工具: ${allowedTools.length ? allowedTools.join(", ") : "none"}。\n` +
         (mode === "write"
           ? '你是终端编码 Agent。你每一步必须只返回 JSON。可用格式：' +
+            '{"type":"plan","items":[{"content":"...","status":"pending|in_progress|completed"}]}、' +
             '{"type":"read","path":"...","reason":"..."}、{"type":"write","path":"...","content":"...","reason":"..."}、{"type":"edit","path":"...","search":"...","replace":"...","reason":"..."}、{"type":"bash","command":"...","args":["..."],"reason":"..."} ' +
             '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-            "工具含义：read读取文件内容；write新建或覆盖文件；edit精确局部修改；bash执行终端命令。当任务完成时返回 final。不要输出 JSON 以外的内容。"
+            "工具含义：plan维护待办计划；read读取文件内容；write新建或覆盖文件；edit精确局部修改；bash执行终端命令。大任务先用 plan 写计划，每做完一步用 plan 更新状态。当任务完成时返回 final。不要输出 JSON 以外的内容。"
           : mode === "inspect"
             ? '你是项目只读巡检 Agent。你每一步必须只返回 JSON。可用格式：' +
+              '{"type":"plan","items":[{"content":"...","status":"pending|in_progress|completed"}]}、' +
               '{"type":"read","path":"...","reason":"..."} 或 {"type":"bash","command":"...","args":["..."],"reason":"..."} ' +
               '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-              "工具含义：read读取文件内容；bash只允许安全只读命令。你可以用 read 查看已知文件，也可以用 bash rg --files、git status 探查项目。禁止 write/edit。"
+              "工具含义：plan维护待办计划；read读取文件内容；bash只允许安全只读命令。复杂问题先用 plan 写计划，每做完一步用 plan 更新状态。禁止 write/edit。"
             : '你是普通问答助手。你必须只返回 JSON，且只能使用 {"type":"final","answer":{"summary":"...","blocks":[...]}}。禁止返回 command、禁止建议执行命令。') +
         formatProjectRules(projectRules),
     },
@@ -446,12 +472,28 @@ async function runAgentTurn(
     }
 
     if (action.type === "final") {
+      if (plan.some((item) => item.status !== "completed")) {
+        plan = plan.map((item) => ({ ...item, status: "completed" }));
+        renderPlan(plan);
+      }
       return {
         type: "final",
         summary: action.answer.summary,
         blocks: action.answer.blocks ?? [],
         steps: step,
       };
+    }
+
+    if (action.type === "plan") {
+      plan = action.items;
+      spinner?.stop();
+      renderPlan(plan);
+      spinner?.restart();
+      loopMessages.push({
+        role: "user",
+        content: `计划已更新:\n${plan.map((item) => `- [${item.status}] ${item.content}`).join("\n")}`,
+      });
+      continue;
     }
 
     const display = describeTool(action);
