@@ -15,7 +15,8 @@ type AgentAction =
   | { type: "read"; path: string; reason?: string }
   | { type: "write"; path: string; content: string; reason?: string }
   | { type: "edit"; path: string; search: string; replace: string; reason?: string }
-  | { type: "bash"; command: string; args?: string[]; reason?: string };
+  | { type: "bash"; command: string; args?: string[]; reason?: string }
+  | { type: "task"; prompt: string; description?: string };
 
 type AgentTurnResult = {
   type: "final" | "max_steps";
@@ -39,7 +40,7 @@ type IntentResult = {
   confidence: number;
   risk: "low" | "medium" | "high";
   needsTool: boolean;
-  tools: Array<"read" | "write" | "edit" | "bash">;
+  tools: Array<"read" | "write" | "edit" | "bash" | "task">;
 };
 type AgentMode = "answer" | "inspect" | "write";
 type PlanItem = { content: string; status: "pending" | "in_progress" | "completed" };
@@ -163,7 +164,7 @@ function classifyIntentLocally(input: string): IntentResult | null {
   }
 
   if (projectWords.some((word) => text.includes(word)) && inspectWords.some((word) => text.includes(word))) {
-    return { intent: "查看文件/架构", confidence: 0.95, risk: "low", needsTool: true, tools: ["read", "bash"] };
+    return { intent: "查看文件/架构", confidence: 0.95, risk: "low", needsTool: true, tools: ["read", "bash", "task"] };
   }
 
   if (["你是谁", "你可以做什么", "你能做什么"].some((word) => input.includes(word))) {
@@ -199,10 +200,11 @@ async function classifyIntent(input: string, history: ChatMessage[], projectRule
 - write：新建或覆盖文件（创建新文件）
 - edit：精确局部修改（改函数、改配置）
 - bash：执行终端命令（运行、安装、git 等）
+- task：启动子智能体处理局部任务，隔离上下文，只返回摘要
 
 请判断是否需要调用工具，以及具体可能需要哪些工具：
 - 普通问答通常 needsTool=false, tools=[]
-- 查看项目、解释代码、分析错误通常 needsTool=true, tools=["read"] 或 ["read","bash"]
+- 查看项目、解释代码、分析错误通常 needsTool=true, tools=["read"] 或 ["read","bash"]，复杂探索可加 "task"
 - 新增文件通常 tools=["write"]
 - 修改现有代码通常 tools=["read","edit"]，必要时加 "bash"
 - 执行命令通常 tools=["bash"]
@@ -234,8 +236,8 @@ ${formatProjectRules(projectRules)}
       risk: parsed.risk,
       needsTool: typeof parsed.needsTool === "boolean" ? parsed.needsTool : false,
       tools: Array.isArray(parsed.tools)
-        ? parsed.tools.filter((tool): tool is "read" | "write" | "edit" | "bash" =>
-            ["read", "write", "edit", "bash"].includes(String(tool)),
+        ? parsed.tools.filter((tool): tool is "read" | "write" | "edit" | "bash" | "task" =>
+            ["read", "write", "edit", "bash", "task"].includes(String(tool)),
           )
         : [],
     } as IntentResult;
@@ -301,6 +303,14 @@ function parseAgentAction(raw: string): AgentAction | null {
         reason: action.reason ?? "",
       };
     }
+    if (obj.type === "task" && typeof (obj as { prompt?: unknown }).prompt === "string") {
+      const action = obj as { prompt: string; description?: string };
+      return {
+        type: "task",
+        prompt: action.prompt,
+        description: action.description ?? "subtask",
+      };
+    }
     return null;
   } catch {
     return null;
@@ -345,7 +355,47 @@ function quotePowerShellArg(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
-function runTool(action: Exclude<AgentAction, { type: "final" | "plan" }>): Promise<string> {
+async function runSubagent(prompt: string, projectRules: string): Promise<string> {
+  const messages: ChatMessage[] = [{ role: "user", content: prompt }];
+  const maxTurns = 12;
+
+  for (let turn = 1; turn <= maxTurns; turn += 1) {
+    const raw = await askDeepSeek([
+      {
+        role: "system",
+        content:
+          `你是运行在 ${process.cwd()} 的子智能体。你拥有独立上下文，只完成父智能体交给你的局部任务。` +
+          '你每一步必须只返回 JSON。可用工具：{"type":"read","path":"..."}、{"type":"bash","command":"...","args":["..."]}，或 {"type":"final","answer":{"summary":"..."}}。' +
+          "只能使用 read 和安全只读 bash。完成后只总结必要发现，不要输出完整过程。" +
+          formatProjectRules(projectRules),
+      },
+      ...messages,
+    ]);
+    const action = parseAgentAction(raw);
+    if (!action) {
+      messages.push({ role: "assistant", content: raw });
+      messages.push({ role: "user", content: "格式错误。请只输出 read、bash 或 final JSON。" });
+      continue;
+    }
+    if (action.type === "final") {
+      return action.answer.summary;
+    }
+    if (action.type === "plan" || action.type === "write" || action.type === "edit" || action.type === "task") {
+      messages.push({ role: "user", content: `子智能体禁止使用 ${action.type}。请改用 read、安全只读 bash，或 final。` });
+      continue;
+    }
+    if (action.type === "bash" && !isSafeInspectCommand(action.command, action.args ?? [])) {
+      messages.push({ role: "user", content: "子智能体只允许安全只读 bash。请改用 rg --files、git status 等只读命令，或 final。" });
+      continue;
+    }
+    const result = await runTool(action, projectRules);
+    messages.push({ role: "user", content: `工具执行结果 (${describeTool(action)}):\n${result}` });
+  }
+
+  return "子智能体达到最大轮次，未得到最终摘要。";
+}
+
+function runTool(action: Exclude<AgentAction, { type: "final" | "plan" }>, projectRules: string): Promise<string> {
   if (action.type === "read") {
     return Promise.resolve(readFileSync(action.path, "utf8"));
   }
@@ -361,6 +411,9 @@ function runTool(action: Exclude<AgentAction, { type: "final" | "plan" }>): Prom
     writeFileSync(action.path, current.replace(action.search, action.replace), "utf8");
     return Promise.resolve(`edited ${action.path}`);
   }
+  if (action.type === "task") {
+    return runSubagent(action.prompt, projectRules);
+  }
   return runCommand(action.command, action.args ?? []);
 }
 
@@ -373,6 +426,9 @@ function describeTool(action: Exclude<AgentAction, { type: "final" | "plan" }>):
   }
   if (action.type === "edit") {
     return `edit ${action.path}`;
+  }
+  if (action.type === "task") {
+    return `task ${action.description ?? "subtask"}`;
   }
   return `bash ${[action.command, ...(action.args ?? [])].join(" ")}`;
 }
@@ -442,14 +498,15 @@ async function runAgentTurn(
           ? '你是终端编码 Agent。你每一步必须只返回 JSON。可用格式：' +
             '{"type":"plan","items":[{"content":"...","status":"pending|in_progress|completed"}]}、' +
             '{"type":"read","path":"...","reason":"..."}、{"type":"write","path":"...","content":"...","reason":"..."}、{"type":"edit","path":"...","search":"...","replace":"...","reason":"..."}、{"type":"bash","command":"...","args":["..."],"reason":"..."} ' +
+            '、{"type":"task","prompt":"...","description":"..."} ' +
             '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-            "工具含义：plan维护待办计划；read读取文件内容；write新建或覆盖文件；edit精确局部修改；bash执行终端命令。大任务先用 plan 写计划，每做完一步用 plan 更新状态。当任务完成时返回 final。不要输出 JSON 以外的内容。"
+            "工具含义：plan维护待办计划；read读取文件内容；write新建或覆盖文件；edit精确局部修改；bash执行终端命令；task启动独立上下文子智能体处理局部探索任务并返回摘要。大任务先用 plan 写计划，每做完一步用 plan 更新状态。当任务完成时返回 final。不要输出 JSON 以外的内容。"
           : mode === "inspect"
             ? '你是项目只读巡检 Agent。你每一步必须只返回 JSON。可用格式：' +
               '{"type":"plan","items":[{"content":"...","status":"pending|in_progress|completed"}]}、' +
-              '{"type":"read","path":"...","reason":"..."} 或 {"type":"bash","command":"...","args":["..."],"reason":"..."} ' +
+              '{"type":"read","path":"...","reason":"..."} 或 {"type":"bash","command":"...","args":["..."],"reason":"..."} 或 {"type":"task","prompt":"...","description":"..."} ' +
               '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-              "工具含义：plan维护待办计划；read读取文件内容；bash只允许安全只读命令。复杂问题先用 plan 写计划，每做完一步用 plan 更新状态。禁止 write/edit。"
+              "工具含义：plan维护待办计划；read读取文件内容；bash只允许安全只读命令；task把局部探索交给独立上下文子智能体并只接收摘要。复杂问题先用 plan 写计划，每做完一步用 plan 更新状态。禁止 write/edit。"
             : '你是普通问答助手。你必须只返回 JSON，且只能使用 {"type":"final","answer":{"summary":"...","blocks":[...]}}。禁止返回 command、禁止建议执行命令。') +
         formatProjectRules(projectRules),
     },
@@ -513,10 +570,10 @@ async function runAgentTurn(
       continue;
     }
 
-    if (mode === "inspect" && action.type !== "read" && !(action.type === "bash" && isSafeInspectCommand(action.command, action.args ?? []))) {
+    if (mode === "inspect" && action.type !== "read" && action.type !== "task" && !(action.type === "bash" && isSafeInspectCommand(action.command, action.args ?? []))) {
       loopMessages.push({
         role: "user",
-        content: `当前任务为项目只读巡检，只允许 read 或安全只读 bash。请换用 read、bash rg --files、git status 等只读工具，或直接返回 final。被拒绝工具: ${display}`,
+        content: `当前任务为项目只读巡检，只允许 read、task 或安全只读 bash。请换用 read、task、bash rg --files、git status 等只读工具，或直接返回 final。被拒绝工具: ${display}`,
       });
       continue;
     }
@@ -534,7 +591,7 @@ async function runAgentTurn(
       }
     }
 
-    const result = await runTool(action);
+    const result = await runTool(action, projectRules);
     loopMessages.push({
       role: "user",
       content: `工具执行结果 (${display}):\n${result}`,
