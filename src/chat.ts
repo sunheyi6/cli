@@ -40,10 +40,6 @@ const C_INPUT = "\x1b[36m";
 const C_OUTPUT = "\x1b[32m";
 const C_META = "\x1b[90m";
 
-function hr(label: string): string {
-  return `${C_META}-------------------- ${label} --------------------${C_RESET}`;
-}
-
 async function askDeepSeek(messages: ChatMessage[]): Promise<string> {
   const cfg = loadConfig();
   const key = process.env[cfg.apiKeyEnv] ?? cfg.apiKey;
@@ -330,10 +326,6 @@ async function runAgentTurn(
       continue;
     }
 
-    if (action.reason) {
-      console.log(`agent> ${action.reason}`);
-    }
-
     if (mode === "write") {
       const confirm = await askLine(rl, `执行命令: ${display} ? [y/N] `);
       if (!["y", "yes"].includes(confirm.toLowerCase())) {
@@ -346,8 +338,6 @@ async function runAgentTurn(
     }
 
     const result = await runCommand(action.command, action.args ?? []);
-    console.log(`cmd> ${display}`);
-    console.log(result);
     loopMessages.push({
       role: "user",
       content: `命令执行结果 (${display}):\n${result}`,
@@ -415,7 +405,6 @@ export async function startChat(): Promise<void> {
   }
 
   while (true) {
-    console.log(hr("INPUT"));
     const input = await askLine(rl, `${C_INPUT}you> ${C_RESET}`);
       if (input === "/exit" || input === "exit") {
         rl.close();
@@ -431,11 +420,6 @@ export async function startChat(): Promise<void> {
         continue;
       }
       const intent = await classifyIntent(input, history);
-      if (intent) {
-        console.log(
-          `${C_META}意图 = ${intent.intent} | confidence=${intent.confidence.toFixed(2)} | risk=${intent.risk}${C_RESET}`,
-        );
-      }
       if (intent?.risk === "high" || intent?.intent === "高危操作") {
         const ok = await askLine(rl, `${C_META}检测到高危意图，确认继续 Agent 执行? [y/N] ${C_RESET}`);
         if (!["y", "yes"].includes(ok.toLowerCase())) {
@@ -460,11 +444,7 @@ export async function startChat(): Promise<void> {
       const reply = await runAgentTurn(rl, history, input, mode);
       history.push({ role: "user", content: input });
       history.push({ role: "assistant", content: reply.summary });
-      console.log(hr("OUTPUT"));
       renderFinal(reply);
-      console.log(
-        `${C_META}meta: steps=${reply.steps} model=${cfg.model} ts=${new Date().toISOString()}${C_RESET}`,
-      );
   }
 
   await new Promise<void>((resolve) => {
