@@ -36,6 +36,8 @@ type IntentResult = {
     | "非项目相关";
   confidence: number;
   risk: "low" | "medium" | "high";
+  needsTool: boolean;
+  tools: Array<"read" | "write" | "edit" | "bash">;
 };
 type AgentMode = "answer" | "inspect" | "write";
 
@@ -128,15 +130,15 @@ function classifyIntentLocally(input: string): IntentResult | null {
   const destructiveWords = ["删除", "清空", "移除", "reset", "rm ", "del ", "drop"];
 
   if (destructiveWords.some((word) => text.includes(word))) {
-    return { intent: "高危操作", confidence: 0.9, risk: "high" };
+    return { intent: "高危操作", confidence: 0.9, risk: "high", needsTool: true, tools: ["bash"] };
   }
 
   if (projectWords.some((word) => text.includes(word)) && inspectWords.some((word) => text.includes(word))) {
-    return { intent: "查看文件/架构", confidence: 0.95, risk: "low" };
+    return { intent: "查看文件/架构", confidence: 0.95, risk: "low", needsTool: true, tools: ["read", "bash"] };
   }
 
   if (["你是谁", "你可以做什么", "你能做什么"].some((word) => input.includes(word))) {
-    return { intent: "非项目相关", confidence: 0.95, risk: "low" };
+    return { intent: "非项目相关", confidence: 0.95, risk: "low", needsTool: false, tools: [] };
   }
 
   return null;
@@ -163,13 +165,27 @@ async function classifyIntent(input: string, history: ChatMessage[]): Promise<In
    只读 → 代码解释、查看文件/架构、查错/分析、技术问答
    修改 → 新增文件、新增函数、修改现有代码、删除代码、执行命令、高危操作
 
+可用工具：
+- read：读取文件内容（查看代码 / 配置）
+- write：新建或覆盖文件（创建新文件）
+- edit：精确局部修改（改函数、改配置）
+- bash：执行终端命令（运行、安装、git 等）
+
+请判断是否需要调用工具，以及具体可能需要哪些工具：
+- 普通问答通常 needsTool=false, tools=[]
+- 查看项目、解释代码、分析错误通常 needsTool=true, tools=["read"] 或 ["read","bash"]
+- 新增文件通常 tools=["write"]
+- 修改现有代码通常 tools=["read","edit"]，必要时加 "bash"
+- 执行命令通常 tools=["bash"]
+- 删除/高危操作通常 tools=["bash"] 且 risk=high
+
 风险等级：
 low：只读、问答
 medium：新增、修改代码
 high：删除代码、高危操作、执行系统命令
 
 必须严格只输出JSON，格式：
-{"intent":"...","confidence":0.0,"risk":"low|medium|high"}
+{"intent":"...","confidence":0.0,"risk":"low|medium|high","needsTool":true,"tools":["read"]}
 `.trim(),
     },
     ...history.slice(-6),
@@ -182,7 +198,17 @@ high：删除代码、高危操作、执行系统命令
     if (!parsed.intent || !parsed.risk || typeof parsed.confidence !== "number") {
       return null;
     }
-    return parsed as IntentResult;
+    return {
+      intent: parsed.intent,
+      confidence: parsed.confidence,
+      risk: parsed.risk,
+      needsTool: typeof parsed.needsTool === "boolean" ? parsed.needsTool : false,
+      tools: Array.isArray(parsed.tools)
+        ? parsed.tools.filter((tool): tool is "read" | "write" | "edit" | "bash" =>
+            ["read", "write", "edit", "bash"].includes(String(tool)),
+          )
+        : [],
+    } as IntentResult;
   } catch {
     return null;
   }
@@ -361,6 +387,7 @@ async function runAgentTurn(
   history: ChatMessage[],
   userInput: string,
   mode: AgentMode,
+  allowedTools: IntentResult["tools"],
   spinner?: { stop: () => void; restart: () => void },
 ): Promise<AgentTurnResult> {
   const maxSteps = 8;
@@ -368,6 +395,7 @@ async function runAgentTurn(
     {
       role: "system",
       content:
+        `本轮意图识别建议工具: ${allowedTools.length ? allowedTools.join(", ") : "none"}。\n` +
         (mode === "write"
           ? '你是终端编码 Agent。你每一步必须只返回 JSON。可用格式：' +
             '{"type":"read","path":"...","reason":"..."}、{"type":"write","path":"...","content":"...","reason":"..."}、{"type":"edit","path":"...","search":"...","replace":"...","reason":"..."}、{"type":"bash","command":"...","args":["..."],"reason":"..."} ' +
@@ -408,6 +436,14 @@ async function runAgentTurn(
     }
 
     const display = describeTool(action);
+    if (!allowedTools.includes(action.type)) {
+      loopMessages.push({
+        role: "user",
+        content: `意图识别阶段认为本轮不应使用 ${action.type} 工具。允许工具: ${allowedTools.length ? allowedTools.join(", ") : "none"}。请改用允许工具或直接返回 final。被拒绝工具: ${display}`,
+      });
+      continue;
+    }
+
     if (mode === "answer") {
       loopMessages.push({
         role: "user",
@@ -548,8 +584,9 @@ export async function startChat(): Promise<void> {
           高危操作: "write",
           非项目相关: "answer",
         };
-        const mode = intent ? modeByIntent[intent.intent] : "write";
-        reply = await runAgentTurn(rl, history, input, mode, spinner);
+      const mode = intent ? modeByIntent[intent.intent] : "write";
+        const allowedTools = intent?.needsTool ? intent.tools : [];
+        reply = await runAgentTurn(rl, history, input, mode, allowedTools, spinner);
       } finally {
         spinner.stop();
       }
