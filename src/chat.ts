@@ -396,7 +396,7 @@ async function runAgentTurn(
 }
 
 function renderFinal(result: AgentTurnResult): void {
-  console.log(`${C_OUTPUT}suncli> ${result.summary}${C_RESET}`);
+  console.log(`${C_META}suncli>${C_RESET} ${C_OUTPUT}${result.summary}`);
   for (const block of result.blocks) {
     if (block.kind === "text") {
       console.log(block.content);
@@ -409,6 +409,7 @@ function renderFinal(result: AgentTurnResult): void {
       console.log(`${C_META}-------------${C_RESET}`);
     }
   }
+  process.stdout.write(C_RESET);
 }
 
 export async function startChat(): Promise<void> {
