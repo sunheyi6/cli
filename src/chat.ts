@@ -1,6 +1,7 @@
 import readline from "node:readline";
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { loadConfig, saveConfig } from "./config.js";
 
 type ChatMessage = {
@@ -45,6 +46,21 @@ const C_RESET = "\x1b[0m";
 const C_INPUT = "\x1b[36m";
 const C_OUTPUT = "\x1b[32m";
 const C_META = "\x1b[90m";
+
+function loadProjectRules(): string {
+  const rulesPath = join(process.cwd(), "agents.md");
+  if (!existsSync(rulesPath)) {
+    return "";
+  }
+  return readFileSync(rulesPath, "utf8").trim();
+}
+
+function formatProjectRules(rules: string): string {
+  if (!rules) {
+    return "";
+  }
+  return `\n\n项目规则（来自 agents.md，必须遵守）：\n${rules}`;
+}
 
 async function askDeepSeek(messages: ChatMessage[]): Promise<string> {
   const cfg = loadConfig();
@@ -144,7 +160,7 @@ function classifyIntentLocally(input: string): IntentResult | null {
   return null;
 }
 
-async function classifyIntent(input: string, history: ChatMessage[]): Promise<IntentResult | null> {
+async function classifyIntent(input: string, history: ChatMessage[], projectRules: string): Promise<IntentResult | null> {
   const localIntent = classifyIntentLocally(input);
   if (localIntent) {
     return localIntent;
@@ -186,6 +202,7 @@ high：删除代码、高危操作、执行系统命令
 
 必须严格只输出JSON，格式：
 {"intent":"...","confidence":0.0,"risk":"low|medium|high","needsTool":true,"tools":["read"]}
+${formatProjectRules(projectRules)}
 `.trim(),
     },
     ...history.slice(-6),
@@ -388,6 +405,7 @@ async function runAgentTurn(
   userInput: string,
   mode: AgentMode,
   allowedTools: IntentResult["tools"],
+  projectRules: string,
   spinner?: { stop: () => void; restart: () => void },
 ): Promise<AgentTurnResult> {
   const maxSteps = 8;
@@ -406,7 +424,8 @@ async function runAgentTurn(
               '{"type":"read","path":"...","reason":"..."} 或 {"type":"bash","command":"...","args":["..."],"reason":"..."} ' +
               '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
               "工具含义：read读取文件内容；bash只允许安全只读命令。你可以用 read 查看已知文件，也可以用 bash rg --files、git status 探查项目。禁止 write/edit。"
-            : '你是普通问答助手。你必须只返回 JSON，且只能使用 {"type":"final","answer":{"summary":"...","blocks":[...]}}。禁止返回 command、禁止建议执行命令。'),
+            : '你是普通问答助手。你必须只返回 JSON，且只能使用 {"type":"final","answer":{"summary":"...","blocks":[...]}}。禁止返回 command、禁止建议执行命令。') +
+        formatProjectRules(projectRules),
     },
     ...history,
     { role: "user", content: userInput },
@@ -507,6 +526,7 @@ function renderFinal(result: AgentTurnResult): void {
 
 export async function startChat(): Promise<void> {
   const cfg = loadConfig();
+  const projectRules = loadProjectRules();
   console.log(`suncli chat (${cfg.model})`);
   console.log("输入 exit 或 /exit 退出，输入 /help 查看可用命令。");
 
@@ -561,7 +581,7 @@ export async function startChat(): Promise<void> {
       let intent: IntentResult | null = null;
       let reply: AgentTurnResult | null = null;
       try {
-        intent = await classifyIntent(input, history);
+        intent = await classifyIntent(input, history, projectRules);
         if (intent?.risk === "high" || intent?.intent === "高危操作") {
           spinner.stop();
           const ok = await askLine(rl, `${C_META}检测到高危意图，确认继续 Agent 执行? [y/N] ${C_RESET}`);
@@ -584,9 +604,9 @@ export async function startChat(): Promise<void> {
           高危操作: "write",
           非项目相关: "answer",
         };
-      const mode = intent ? modeByIntent[intent.intent] : "write";
+        const mode = intent ? modeByIntent[intent.intent] : "write";
         const allowedTools = intent?.needsTool ? intent.tools : [];
-        reply = await runAgentTurn(rl, history, input, mode, allowedTools, spinner);
+        reply = await runAgentTurn(rl, history, input, mode, allowedTools, projectRules, spinner);
       } finally {
         spinner.stop();
       }
