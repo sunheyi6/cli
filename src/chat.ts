@@ -33,6 +33,7 @@ type IntentResult = {
   confidence: number;
   risk: "low" | "medium" | "high";
 };
+type AgentMode = "answer" | "inspect" | "write";
 
 const C_RESET = "\x1b[0m";
 const C_INPUT = "\x1b[36m";
@@ -80,14 +81,56 @@ function askLine(rl: readline.Interface, prompt: string): Promise<string> {
   return new Promise((resolve) => rl.question(prompt, (line: string) => resolve(line.trim())));
 }
 
+function classifyIntentLocally(input: string): IntentResult | null {
+  const text = input.toLowerCase();
+  const projectWords = ["这个项目", "当前项目", "本项目", "项目", "代码库", "仓库", "工程"];
+  const inspectWords = ["做什么", "什么功能", "有哪些功能", "功能", "架构", "目录", "文件", "结构"];
+  const destructiveWords = ["删除", "清空", "移除", "reset", "rm ", "del ", "drop"];
+
+  if (destructiveWords.some((word) => text.includes(word))) {
+    return { intent: "高危操作", confidence: 0.9, risk: "high" };
+  }
+
+  if (projectWords.some((word) => text.includes(word)) && inspectWords.some((word) => text.includes(word))) {
+    return { intent: "查看文件/架构", confidence: 0.95, risk: "low" };
+  }
+
+  if (["你是谁", "你可以做什么", "你能做什么"].some((word) => input.includes(word))) {
+    return { intent: "非项目相关", confidence: 0.95, risk: "low" };
+  }
+
+  return null;
+}
+
 async function classifyIntent(input: string, history: ChatMessage[]): Promise<IntentResult | null> {
+  const localIntent = classifyIntentLocally(input);
+  if (localIntent) {
+    return localIntent;
+  }
+
   const raw = await askDeepSeek([
     {
       role: "system",
       content:
-        "你是意图识别专家。按以下规则内部推理但不要输出过程，只输出 JSON：" +
-        '{"intent":"...","confidence":0.0,"risk":"low|medium|high"}。' +
-        "intent 只能是：代码解释、查看文件/架构、查错/分析、技术问答、新增文件、新增函数、修改现有代码、删除代码、执行命令、高危操作、非项目相关。",
+        `
+你是严格的意图分类器。
+请按照层级一步步思考，但不要输出思考过程，只输出最终JSON。
+
+层级判断规则：
+1. 是否与项目代码/文件相关？
+   不相关 → intent: 非项目相关
+2. 相关 → 判断是只读还是修改？
+   只读 → 代码解释、查看文件/架构、查错/分析、技术问答
+   修改 → 新增文件、新增函数、修改现有代码、删除代码、执行命令、高危操作
+
+风险等级：
+low：只读、问答
+medium：新增、修改代码
+high：删除代码、高危操作、执行系统命令
+
+必须严格只输出JSON，格式：
+{"intent":"...","confidence":0.0,"risk":"low|medium|high"}
+`.trim(),
     },
     ...history.slice(-6),
     { role: "user", content: input },
@@ -137,9 +180,63 @@ function parseAgentAction(raw: string): AgentAction | null {
   }
 }
 
+function isSafeInspectCommand(command: string, args: string[]): boolean {
+  if (/\s/.test(command)) {
+    return false;
+  }
+
+  const dangerousTokens = [">", ">>", "|", ";", "&&", "||", "`"];
+  if (args.some((arg) => dangerousTokens.some((token) => arg.includes(token)))) {
+    return false;
+  }
+
+  const cmd = command.toLowerCase();
+  const safeCommands = new Set([
+    "rg",
+    "dir",
+    "ls",
+    "cat",
+    "type",
+    "pwd",
+    "get-childitem",
+    "get-content",
+    "get-location",
+  ]);
+  if (safeCommands.has(cmd)) {
+    return true;
+  }
+
+  if (cmd === "git") {
+    const subcommand = (args[0] ?? "").toLowerCase();
+    return ["status", "branch", "log", "show", "diff", "ls-files", "remote"].includes(subcommand);
+  }
+
+  return false;
+}
+
+function quotePowerShellArg(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 function runCommand(command: string, args: string[]): Promise<string> {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { shell: true });
+    const child =
+      process.platform === "win32"
+        ? spawn(
+            "powershell.exe",
+            [
+              "-NoProfile",
+              "-ExecutionPolicy",
+              "Bypass",
+              "-Command",
+              `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ${[
+                command,
+                ...args.map(quotePowerShellArg),
+              ].join(" ")}`,
+            ],
+            { env: { ...process.env, PYTHONIOENCODING: "utf-8" } },
+          )
+        : spawn(command, args, { shell: true });
     let stdout = "";
     let stderr = "";
 
@@ -170,16 +267,24 @@ async function runAgentTurn(
   rl: readline.Interface,
   history: ChatMessage[],
   userInput: string,
+  mode: AgentMode,
 ): Promise<AgentTurnResult> {
   const maxSteps = 8;
   const loopMessages: ChatMessage[] = [
     {
       role: "system",
       content:
-        '你是终端编码 Agent。你每一步必须只返回 JSON。可用格式：' +
-        '{"type":"command","command":"...","args":["..."],"reason":"..."} ' +
-        '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-        "当需要查看信息或执行操作时用 command；当任务完成时返回 final。不要输出 JSON 以外的内容。",
+        (mode === "write"
+          ? '你是终端编码 Agent。你每一步必须只返回 JSON。可用格式：' +
+            '{"type":"command","command":"...","args":["..."],"reason":"..."} ' +
+            '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
+            "当需要查看信息或执行操作时用 command；当任务完成时返回 final。不要输出 JSON 以外的内容。"
+          : mode === "inspect"
+            ? '你是项目只读巡检 Agent。你每一步必须只返回 JSON。可用格式：' +
+              '{"type":"command","command":"...","args":["..."],"reason":"..."} ' +
+              '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
+              "你可以用只读命令查看当前项目，例如 rg --files、Get-Content package.json、Get-Content agents.md、git status。禁止修改、删除、安装依赖或执行非只读命令。"
+            : '你是普通问答助手。你必须只返回 JSON，且只能使用 {"type":"final","answer":{"summary":"...","blocks":[...]}}。禁止返回 command、禁止建议执行命令。'),
     },
     ...history,
     { role: "user", content: userInput },
@@ -209,16 +314,35 @@ async function runAgentTurn(
     }
 
     const display = [action.command, ...(action.args ?? [])].join(" ");
+    if (mode === "answer") {
+      loopMessages.push({
+        role: "user",
+        content: `当前任务为普通问答，禁止执行命令。请直接返回 final。你刚才的命令: ${display}`,
+      });
+      continue;
+    }
+
+    if (mode === "inspect" && !isSafeInspectCommand(action.command, action.args ?? [])) {
+      loopMessages.push({
+        role: "user",
+        content: `当前任务为项目只读巡检，只允许安全读取命令。请换用 rg --files、Get-Content、git status 等只读命令，或直接返回 final。被拒绝命令: ${display}`,
+      });
+      continue;
+    }
+
     if (action.reason) {
       console.log(`agent> ${action.reason}`);
     }
-    const confirm = await askLine(rl, `执行命令: ${display} ? [y/N] `);
-    if (!["y", "yes"].includes(confirm.toLowerCase())) {
-      loopMessages.push({
-        role: "user",
-        content: `命令被用户拒绝: ${display}`,
-      });
-      continue;
+
+    if (mode === "write") {
+      const confirm = await askLine(rl, `执行命令: ${display} ? [y/N] `);
+      if (!["y", "yes"].includes(confirm.toLowerCase())) {
+        loopMessages.push({
+          role: "user",
+          content: `命令被用户拒绝: ${display}`,
+        });
+        continue;
+      }
     }
 
     const result = await runCommand(action.command, action.args ?? []);
@@ -319,7 +443,21 @@ export async function startChat(): Promise<void> {
           continue;
         }
       }
-      const reply = await runAgentTurn(rl, history, input);
+      const modeByIntent: Record<IntentResult["intent"], AgentMode> = {
+        代码解释: "inspect",
+        "查看文件/架构": "inspect",
+        "查错/分析": "inspect",
+        技术问答: "answer",
+        新增文件: "write",
+        新增函数: "write",
+        修改现有代码: "write",
+        删除代码: "write",
+        执行命令: "write",
+        高危操作: "write",
+        非项目相关: "answer",
+      };
+      const mode = intent ? modeByIntent[intent.intent] : "write";
+      const reply = await runAgentTurn(rl, history, input, mode);
       history.push({ role: "user", content: input });
       history.push({ role: "assistant", content: reply.summary });
       console.log(hr("OUTPUT"));

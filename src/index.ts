@@ -79,8 +79,16 @@ configCommand
     console.log(JSON.stringify(next, null, 2));
   });
 
-if (process.argv.length <= 2) {
-  await startChat();
-} else {
+async function main(): Promise<void> {
+  if (process.argv.length <= 2) {
+    await startChat();
+    return;
+  }
   program.parse();
 }
+
+main().catch((err: unknown) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`fatal: ${msg}`);
+  process.exit(1);
+});
