@@ -77,6 +77,46 @@ function askLine(rl: readline.Interface, prompt: string): Promise<string> {
   return new Promise((resolve) => rl.question(prompt, (line: string) => resolve(line.trim())));
 }
 
+function startSpinner(text = "思考中"): () => void {
+  if (!process.stdout.isTTY) {
+    return () => undefined;
+  }
+
+  const frames = ["-", "\\", "|", "/"];
+  let index = 0;
+  const timer = setInterval(() => {
+    process.stdout.write(`\r${C_META}${frames[index % frames.length]} ${text}${C_RESET}`);
+    index += 1;
+  }, 120);
+
+  return () => {
+    clearInterval(timer);
+    process.stdout.write("\r\x1b[2K");
+  };
+}
+
+function createSpinner(text = "思考中"): { stop: () => void; restart: () => void } {
+  let stopCurrent = startSpinner(text);
+  let active = true;
+
+  return {
+    stop: () => {
+      if (!active) {
+        return;
+      }
+      stopCurrent();
+      active = false;
+    },
+    restart: () => {
+      if (active) {
+        return;
+      }
+      stopCurrent = startSpinner(text);
+      active = true;
+    },
+  };
+}
+
 function classifyIntentLocally(input: string): IntentResult | null {
   const text = input.toLowerCase();
   const projectWords = ["这个项目", "当前项目", "本项目", "项目", "代码库", "仓库", "工程"];
@@ -264,6 +304,7 @@ async function runAgentTurn(
   history: ChatMessage[],
   userInput: string,
   mode: AgentMode,
+  spinner?: { stop: () => void; restart: () => void },
 ): Promise<AgentTurnResult> {
   const maxSteps = 8;
   const loopMessages: ChatMessage[] = [
@@ -327,7 +368,9 @@ async function runAgentTurn(
     }
 
     if (mode === "write") {
+      spinner?.stop();
       const confirm = await askLine(rl, `执行命令: ${display} ? [y/N] `);
+      spinner?.restart();
       if (!["y", "yes"].includes(confirm.toLowerCase())) {
         loopMessages.push({
           role: "user",
@@ -419,29 +462,42 @@ export async function startChat(): Promise<void> {
         console.log("已清空会话上下文。");
         continue;
       }
-      const intent = await classifyIntent(input, history);
-      if (intent?.risk === "high" || intent?.intent === "高危操作") {
-        const ok = await askLine(rl, `${C_META}检测到高危意图，确认继续 Agent 执行? [y/N] ${C_RESET}`);
-        if (!["y", "yes"].includes(ok.toLowerCase())) {
-          console.log(`${C_OUTPUT}suncli> 已取消本次高危请求。${C_RESET}`);
-          continue;
+      const spinner = createSpinner();
+
+      let intent: IntentResult | null = null;
+      let reply: AgentTurnResult | null = null;
+      try {
+        intent = await classifyIntent(input, history);
+        if (intent?.risk === "high" || intent?.intent === "高危操作") {
+          spinner.stop();
+          const ok = await askLine(rl, `${C_META}检测到高危意图，确认继续 Agent 执行? [y/N] ${C_RESET}`);
+          if (!["y", "yes"].includes(ok.toLowerCase())) {
+            console.log(`${C_OUTPUT}suncli> 已取消本次高危请求。${C_RESET}`);
+            continue;
+          }
+          spinner.restart();
         }
+        const modeByIntent: Record<IntentResult["intent"], AgentMode> = {
+          代码解释: "inspect",
+          "查看文件/架构": "inspect",
+          "查错/分析": "inspect",
+          技术问答: "answer",
+          新增文件: "write",
+          新增函数: "write",
+          修改现有代码: "write",
+          删除代码: "write",
+          执行命令: "write",
+          高危操作: "write",
+          非项目相关: "answer",
+        };
+        const mode = intent ? modeByIntent[intent.intent] : "write";
+        reply = await runAgentTurn(rl, history, input, mode, spinner);
+      } finally {
+        spinner.stop();
       }
-      const modeByIntent: Record<IntentResult["intent"], AgentMode> = {
-        代码解释: "inspect",
-        "查看文件/架构": "inspect",
-        "查错/分析": "inspect",
-        技术问答: "answer",
-        新增文件: "write",
-        新增函数: "write",
-        修改现有代码: "write",
-        删除代码: "write",
-        执行命令: "write",
-        高危操作: "write",
-        非项目相关: "answer",
-      };
-      const mode = intent ? modeByIntent[intent.intent] : "write";
-      const reply = await runAgentTurn(rl, history, input, mode);
+      if (!reply) {
+        continue;
+      }
       history.push({ role: "user", content: input });
       history.push({ role: "assistant", content: reply.summary });
       renderFinal(reply);
