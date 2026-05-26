@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.memory/
+.runtime-tasks/
+.skills/
+.tasks/
+.team/
+.worktrees/
