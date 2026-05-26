@@ -1,5 +1,6 @@
 import readline from "node:readline";
 import { spawn } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
 import { loadConfig, saveConfig } from "./config.js";
 
 type ChatMessage = {
@@ -9,7 +10,10 @@ type ChatMessage = {
 
 type AgentAction =
   | { type: "final"; answer: { summary: string; blocks?: Array<{ kind: "text" | "code"; content: string; language?: string }> } }
-  | { type: "command"; command: string; args?: string[]; reason?: string };
+  | { type: "read"; path: string; reason?: string }
+  | { type: "write"; path: string; content: string; reason?: string }
+  | { type: "edit"; path: string; search: string; replace: string; reason?: string }
+  | { type: "bash"; command: string; args?: string[]; reason?: string };
 
 type AgentTurnResult = {
   type: "final" | "max_steps";
@@ -202,12 +206,33 @@ function parseAgentAction(raw: string): AgentAction | null {
         },
       };
     }
-    if (obj.type === "command" && typeof obj.command === "string") {
+    if (obj.type === "read" && typeof (obj as { path?: unknown }).path === "string") {
+      return { type: "read", path: (obj as { path: string }).path, reason: typeof (obj as { reason?: unknown }).reason === "string" ? (obj as { reason: string }).reason : "" };
+    }
+    if (
+      obj.type === "write" &&
+      typeof (obj as { path?: unknown }).path === "string" &&
+      typeof (obj as { content?: unknown }).content === "string"
+    ) {
+      const action = obj as { path: string; content: string; reason?: string };
+      return { type: "write", path: action.path, content: action.content, reason: action.reason ?? "" };
+    }
+    if (
+      obj.type === "edit" &&
+      typeof (obj as { path?: unknown }).path === "string" &&
+      typeof (obj as { search?: unknown }).search === "string" &&
+      typeof (obj as { replace?: unknown }).replace === "string"
+    ) {
+      const action = obj as { path: string; search: string; replace: string; reason?: string };
+      return { type: "edit", path: action.path, search: action.search, replace: action.replace, reason: action.reason ?? "" };
+    }
+    if (obj.type === "bash" && typeof (obj as { command?: unknown }).command === "string") {
+      const action = obj as { command: string; args?: unknown[]; reason?: string };
       return {
-        type: "command",
-        command: obj.command,
-        args: Array.isArray(obj.args) ? obj.args.map(String) : [],
-        reason: typeof obj.reason === "string" ? obj.reason : "",
+        type: "bash",
+        command: action.command,
+        args: Array.isArray(action.args) ? action.args.map(String) : [],
+        reason: action.reason ?? "",
       };
     }
     return null;
@@ -252,6 +277,38 @@ function isSafeInspectCommand(command: string, args: string[]): boolean {
 
 function quotePowerShellArg(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
+}
+
+function runTool(action: Exclude<AgentAction, { type: "final" }>): Promise<string> {
+  if (action.type === "read") {
+    return Promise.resolve(readFileSync(action.path, "utf8"));
+  }
+  if (action.type === "write") {
+    writeFileSync(action.path, action.content, "utf8");
+    return Promise.resolve(`wrote ${action.path}`);
+  }
+  if (action.type === "edit") {
+    const current = readFileSync(action.path, "utf8");
+    if (!current.includes(action.search)) {
+      return Promise.resolve(`edit failed: search text not found in ${action.path}`);
+    }
+    writeFileSync(action.path, current.replace(action.search, action.replace), "utf8");
+    return Promise.resolve(`edited ${action.path}`);
+  }
+  return runCommand(action.command, action.args ?? []);
+}
+
+function describeTool(action: Exclude<AgentAction, { type: "final" }>): string {
+  if (action.type === "read") {
+    return `read ${action.path}`;
+  }
+  if (action.type === "write") {
+    return `write ${action.path}`;
+  }
+  if (action.type === "edit") {
+    return `edit ${action.path}`;
+  }
+  return `bash ${[action.command, ...(action.args ?? [])].join(" ")}`;
 }
 
 function runCommand(command: string, args: string[]): Promise<string> {
@@ -313,14 +370,14 @@ async function runAgentTurn(
       content:
         (mode === "write"
           ? '你是终端编码 Agent。你每一步必须只返回 JSON。可用格式：' +
-            '{"type":"command","command":"...","args":["..."],"reason":"..."} ' +
+            '{"type":"read","path":"...","reason":"..."}、{"type":"write","path":"...","content":"...","reason":"..."}、{"type":"edit","path":"...","search":"...","replace":"...","reason":"..."}、{"type":"bash","command":"...","args":["..."],"reason":"..."} ' +
             '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-            "当需要查看信息或执行操作时用 command；当任务完成时返回 final。不要输出 JSON 以外的内容。"
+            "工具含义：read读取文件内容；write新建或覆盖文件；edit精确局部修改；bash执行终端命令。当任务完成时返回 final。不要输出 JSON 以外的内容。"
           : mode === "inspect"
             ? '你是项目只读巡检 Agent。你每一步必须只返回 JSON。可用格式：' +
-              '{"type":"command","command":"...","args":["..."],"reason":"..."} ' +
+              '{"type":"read","path":"...","reason":"..."} 或 {"type":"bash","command":"...","args":["..."],"reason":"..."} ' +
               '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-              "你可以用只读命令查看当前项目，例如 rg --files、Get-Content package.json、Get-Content agents.md、git status。禁止修改、删除、安装依赖或执行非只读命令。"
+              "工具含义：read读取文件内容；bash只允许安全只读命令。你可以用 read 查看已知文件，也可以用 bash rg --files、git status 探查项目。禁止 write/edit。"
             : '你是普通问答助手。你必须只返回 JSON，且只能使用 {"type":"final","answer":{"summary":"...","blocks":[...]}}。禁止返回 command、禁止建议执行命令。'),
     },
     ...history,
@@ -336,7 +393,7 @@ async function runAgentTurn(
       loopMessages.push({
         role: "user",
         content:
-          '格式错误。请只输出合法 JSON，格式为 {"type":"command"...} 或 {"type":"final","answer":{"summary":"...","blocks":[...]}}。',
+          '格式错误。请只输出合法 JSON，工具格式为 read/write/edit/bash，或 final answer。',
       });
       continue;
     }
@@ -350,26 +407,26 @@ async function runAgentTurn(
       };
     }
 
-    const display = [action.command, ...(action.args ?? [])].join(" ");
+    const display = describeTool(action);
     if (mode === "answer") {
       loopMessages.push({
         role: "user",
-        content: `当前任务为普通问答，禁止执行命令。请直接返回 final。你刚才的命令: ${display}`,
+        content: `当前任务为普通问答，禁止工具调用。请直接返回 final。你刚才的工具调用: ${display}`,
       });
       continue;
     }
 
-    if (mode === "inspect" && !isSafeInspectCommand(action.command, action.args ?? [])) {
+    if (mode === "inspect" && action.type !== "read" && !(action.type === "bash" && isSafeInspectCommand(action.command, action.args ?? []))) {
       loopMessages.push({
         role: "user",
-        content: `当前任务为项目只读巡检，只允许安全读取命令。请换用 rg --files、Get-Content、git status 等只读命令，或直接返回 final。被拒绝命令: ${display}`,
+        content: `当前任务为项目只读巡检，只允许 read 或安全只读 bash。请换用 read、bash rg --files、git status 等只读工具，或直接返回 final。被拒绝工具: ${display}`,
       });
       continue;
     }
 
-    if (mode === "write") {
+    if (mode === "write" && action.type !== "read") {
       spinner?.stop();
-      const confirm = await askLine(rl, `执行命令: ${display} ? [y/N] `);
+      const confirm = await askLine(rl, `调用工具: ${display} ? [y/N] `);
       spinner?.restart();
       if (!["y", "yes"].includes(confirm.toLowerCase())) {
         loopMessages.push({
@@ -380,10 +437,10 @@ async function runAgentTurn(
       }
     }
 
-    const result = await runCommand(action.command, action.args ?? []);
+    const result = await runTool(action);
     loopMessages.push({
       role: "user",
-      content: `命令执行结果 (${display}):\n${result}`,
+      content: `工具执行结果 (${display}):\n${result}`,
     });
   }
 
