@@ -508,7 +508,7 @@ async function runAgentTurn(
 }
 
 function renderFinal(result: AgentTurnResult): void {
-  console.log(`${C_META}suncli>${C_RESET} ${C_OUTPUT}${result.summary}`);
+  console.log(`${C_META}${process.cwd()}>${C_RESET} ${C_OUTPUT}${result.summary}`);
   for (const block of result.blocks) {
     if (block.kind === "text") {
       console.log(block.content);
@@ -586,7 +586,7 @@ export async function startChat(): Promise<void> {
           spinner.stop();
           const ok = await askLine(rl, `${C_META}检测到高危意图，确认继续 Agent 执行? [y/N] ${C_RESET}`);
           if (!["y", "yes"].includes(ok.toLowerCase())) {
-            console.log(`${C_OUTPUT}suncli> 已取消本次高危请求。${C_RESET}`);
+            console.log(`${C_OUTPUT}${process.cwd()}> 已取消本次高危请求。${C_RESET}`);
             continue;
           }
           spinner.restart();
