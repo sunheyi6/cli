@@ -1,6 +1,6 @@
 import readline from "node:readline";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadConfig, saveConfig } from "./config.js";
 
@@ -52,6 +52,7 @@ const C_RESET = "\x1b[0m";
 const C_INPUT = "\x1b[36m";
 const C_OUTPUT = "\x1b[32m";
 const C_META = "\x1b[90m";
+const C_DONE = "\x1b[32m";
 
 function renderPlan(items: PlanItem[]): void {
   if (items.length === 0) {
@@ -60,8 +61,25 @@ function renderPlan(items: PlanItem[]): void {
   console.log(`${C_META}plan>${C_RESET}`);
   for (const item of items) {
     const mark = item.status === "completed" ? "x" : item.status === "in_progress" ? ">" : " ";
-    console.log(`${C_META}- [${mark}] ${item.content}${C_RESET}`);
+    const markColor = item.status === "completed" ? C_DONE : C_META;
+    console.log(`${C_META}- [${markColor}${mark}${C_META}] ${item.content}${C_RESET}`);
   }
+}
+
+function advancePlanProgress(items: PlanItem[]): PlanItem[] {
+  if (items.length === 0) {
+    return items;
+  }
+  const next = items.map((item) => ({ ...item }));
+  const activeIndex = next.findIndex((item) => item.status === "in_progress");
+  if (activeIndex >= 0) {
+    next[activeIndex].status = "completed";
+  }
+  const pendingIndex = next.findIndex((item) => item.status === "pending");
+  if (pendingIndex >= 0) {
+    next[pendingIndex].status = "in_progress";
+  }
+  return next;
 }
 
 const SLASH_COMMANDS: Array<{ name: SlashCommandName; description: string; aliases: string[] }> = [
@@ -526,19 +544,44 @@ async function runSubagent(agent: SubagentName, prompt: string, projectRules: st
 
 function runTool(action: Exclude<AgentAction, { type: "final" | "plan" }>, projectRules: string): Promise<string> {
   if (action.type === "read") {
-    return Promise.resolve(readFileSync(action.path, "utf8"));
+    try {
+      const stats = statSync(action.path);
+      if (stats.isDirectory()) {
+        const entries = readdirSync(action.path).sort();
+        return Promise.resolve(
+          [
+            `[directory] ${action.path}`,
+            ...entries.map((name) => `- ${name}`),
+          ].join("\n"),
+        );
+      }
+      return Promise.resolve(readFileSync(action.path, "utf8"));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return Promise.resolve(`read failed: ${message}`);
+    }
   }
   if (action.type === "write") {
-    writeFileSync(action.path, action.content, "utf8");
-    return Promise.resolve(`wrote ${action.path}`);
+    try {
+      writeFileSync(action.path, action.content, "utf8");
+      return Promise.resolve(`wrote ${action.path}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return Promise.resolve(`write failed: ${message}`);
+    }
   }
   if (action.type === "edit") {
-    const current = readFileSync(action.path, "utf8");
-    if (!current.includes(action.search)) {
-      return Promise.resolve(`edit failed: search text not found in ${action.path}`);
+    try {
+      const current = readFileSync(action.path, "utf8");
+      if (!current.includes(action.search)) {
+        return Promise.resolve(`edit failed: search text not found in ${action.path}`);
+      }
+      writeFileSync(action.path, current.replace(action.search, action.replace), "utf8");
+      return Promise.resolve(`edited ${action.path}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return Promise.resolve(`edit failed: ${message}`);
     }
-    writeFileSync(action.path, current.replace(action.search, action.replace), "utf8");
-    return Promise.resolve(`edited ${action.path}`);
   }
   if (action.type === "task") {
     return runSubagent(action.agent ?? "explorer", action.prompt, projectRules);
@@ -729,6 +772,20 @@ async function runAgentTurn(
     }
 
     const result = await runTool(action, projectRules);
+    if (plan.length > 0) {
+      const updatedPlan = advancePlanProgress(plan);
+      const planChanged = JSON.stringify(updatedPlan) !== JSON.stringify(plan);
+      if (planChanged) {
+        plan = updatedPlan;
+        spinner?.stop();
+        renderPlan(plan);
+        spinner?.restart();
+        loopMessages.push({
+          role: "user",
+          content: `计划已自动推进:\n${plan.map((item) => `- [${item.status}] ${item.content}`).join("\n")}`,
+        });
+      }
+    }
     loopMessages.push({
       role: "user",
       content: `工具执行结果 (${display}):\n${result}`,
