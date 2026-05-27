@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import Fuse from "fuse.js";
 import chalk from "chalk";
@@ -48,40 +49,58 @@ type AgentTurnResult = {
   blocks: Array<{ kind: "text" | "code"; content: string; language?: string }>;
   steps: number;
 };
+type SkillMeta = { name: string; description: string; path: string };
+
 type AgentMode = "answer" | "inspect" | "write";
 type PlanItem = { content: string; status: "pending" | "in_progress" | "completed" };
-type SlashCommandName = "help" | "clear" | "exit" | "agents" | "tools" | "rules";
-type SlashCommandResult = "handled" | "exit" | "not_slash";
+type SlashCommandResult = { type: "handled" } | { type: "exit" } | { type: "not_slash" } | { type: "skill_loaded" } | { type: "skill_with_task" } | { type: "fill_editor"; text: string };
 type SubagentName = "explorer" | "planner" | "worker";
-type SlashCommand = { name: SlashCommandName; description: string; aliases: string[] };
+type SlashCommand = { name: string; description: string; aliases: string[]; kind: "builtin" | "skill"; skillPath?: string };
 type SlashCommandMatch = { command: SlashCommand; score: number };
 
-const C_RESET = "\x1b[0m";
-const C_INPUT = "\x1b[36m";
-const C_OUTPUT = "\x1b[32m";
-const C_META = "\x1b[90m";
-const C_DONE = "\x1b[32m";
-
-const SLASH_COMMANDS: SlashCommand[] = [
+const BUILTIN_COMMANDS: Omit<SlashCommand, "kind">[] = [
   { name: "help", description: "显示可用斜杠命令", aliases: ["h", "?"] },
   { name: "clear", description: "清空当前会话上下文", aliases: ["cls", "reset"] },
   { name: "exit", description: "退出会话", aliases: ["quit", "q"] },
   { name: "agents", description: "查看内置子智能体", aliases: ["agent", "subagents"] },
   { name: "tools", description: "查看可用工具", aliases: ["tool"] },
   { name: "rules", description: "查看 agents.md 是否已加载", aliases: ["rule"] },
+  { name: "skills", description: "列出所有可用技能", aliases: ["skill"] },
 ];
-const SLASH_FUSE = new Fuse(SLASH_COMMANDS, {
-  keys: ["name", "aliases", "description"],
-  threshold: 0.45,
-  includeScore: true,
-});
+
+function buildSlashCommands(skills: SkillMeta[]): { commands: SlashCommand[]; warnings: string[] } {
+  const builtinNames = new Set(BUILTIN_COMMANDS.map((c) => c.name));
+  const commands: SlashCommand[] = BUILTIN_COMMANDS.map((c) => ({ ...c, kind: "builtin" as const }));
+  const warnings: string[] = [];
+
+  for (const skill of skills) {
+    let name = skill.name;
+    if (builtinNames.has(name)) {
+      name = `skill-${name}`;
+      warnings.push(`技能 "${skill.name}" 与内置命令冲突，已重命名为 /${name}`);
+    }
+    builtinNames.add(name);
+    commands.push({
+      name,
+      description: skill.description,
+      aliases: [],
+      kind: "skill",
+      skillPath: skill.path,
+    });
+  }
+
+  return { commands, warnings };
+}
+
+let slashCommands: SlashCommand[] = BUILTIN_COMMANDS.map((c) => ({ ...c, kind: "builtin" as const }));
+let slashFuse = new Fuse(slashCommands, { keys: ["name", "aliases", "description"], threshold: 0.45, includeScore: true });
 
 function searchSlashCommands(query: string): SlashCommandMatch[] {
   const normalized = query.trim().replace(/^\//, "").toLowerCase();
   if (!normalized) {
-    return SLASH_COMMANDS.map((command) => ({ command, score: 1 }));
+    return slashCommands.map((command) => ({ command, score: 1 }));
   }
-  return SLASH_FUSE.search(normalized)
+  return slashFuse.search(normalized)
     .map((result) => ({
       command: result.item,
       score: 1 - (result.score ?? 1),
@@ -89,38 +108,31 @@ function searchSlashCommands(query: string): SlashCommandMatch[] {
     .sort((a, b) => b.score - a.score || a.command.name.length - b.command.name.length);
 }
 
-function findExactSlashCommand(input: string): SlashCommandName | null {
+function findExactSlashCommand(input: string): SlashCommand | null {
   const query = input.slice(1).trim().toLowerCase();
-  if (!query) {
-    return null;
+  if (!query) return null;
+  for (const cmd of slashCommands) {
+    if ([cmd.name, ...cmd.aliases].includes(query)) return cmd;
   }
-
-  for (const command of SLASH_COMMANDS) {
-    if ([command.name, ...command.aliases].includes(query)) {
-      return command.name;
-    }
-  }
-
   return null;
 }
 
 function renderSlashHelp(): string {
-  const lines: string[] = [`${C_META}commands>${C_RESET}`];
-  for (const command of SLASH_COMMANDS) {
-    lines.push(`${C_META}/${command.name.padEnd(9)} ${command.description}${C_RESET}`);
+  const lines: string[] = ["commands>"];
+  for (const cmd of slashCommands) {
+    const prefix = cmd.kind === "skill" ? "📦 " : "";
+    lines.push(`${prefix}/${cmd.name.padEnd(11)} ${cmd.description.slice(0, 55)}`);
   }
   return lines.join("\n");
 }
 
-async function pickSlashCommandTui(tui: TUI, matches: SlashCommandMatch[]): Promise<SlashCommandName | null> {
-  if (matches.length === 0) {
-    return null;
-  }
+async function pickSlashCommandTui(tui: TUI, matches: SlashCommandMatch[]): Promise<SlashCommand | null> {
+  if (matches.length === 0) return null;
 
   const visible = matches.slice(0, 8);
   const items: SelectItem[] = visible.map((m) => ({
     value: m.command.name,
-    label: `/${m.command.name}`,
+    label: `${m.command.kind === "skill" ? "📦 " : ""}/${m.command.name}`,
     description: m.command.description,
   }));
 
@@ -141,7 +153,8 @@ async function pickSlashCommandTui(tui: TUI, matches: SlashCommandMatch[]): Prom
 
     list.onSelect = (item) => {
       handle.hide();
-      resolve(item.value as SlashCommandName);
+      const cmd = visible.find((m) => m.command.name === item.value)?.command ?? null;
+      resolve(cmd);
     };
     list.onCancel = () => {
       handle.hide();
@@ -157,47 +170,83 @@ async function handleSlashCommand(
   history: ChatMessage[],
   projectRules: string,
   tui: TUI,
+  messagesContainer: Container,
 ): Promise<SlashCommandResult> {
   if (!input.startsWith("/")) {
-    return "not_slash";
+    return { type: "not_slash" };
   }
 
   const exactCommand = findExactSlashCommand(input);
   const matches = searchSlashCommands(input);
   if (matches.length === 0) {
-    return "handled";
+    return { type: "handled" };
   }
 
   const command = exactCommand ?? (await pickSlashCommandTui(tui, matches));
-  if (!command) {
-    return "handled";
+  if (!command) return { type: "handled" };
+
+  // Skill picked from fuzzy picker (no exact match) → fill editor for task input
+  if (!exactCommand && command.kind === "skill" && command.skillPath) {
+    return { type: "fill_editor", text: `/${command.name} ` };
   }
 
-  if (command === "help") {
-    console.log(renderSlashHelp());
-    return "handled";
+  // Skill with exact match (/skillname or /skillname task) → load and execute
+  if (command.kind === "skill" && command.skillPath) {
+    try {
+      const content = readFileSync(command.skillPath, "utf8");
+      history.push({ role: "system", content: `技能指令已加载 (${command.name}):\n\n${content}` });
+      addMessage(messagesContainer, `📦 已激活技能: ${command.name}`, "system");
+      const taskMatch = input.match(new RegExp(`^/${command.name}\\s+(.+)$`, "i"));
+      if (taskMatch) {
+        history.push({ role: "user", content: taskMatch[1] });
+        return { type: "skill_with_task" };
+      }
+      return { type: "skill_loaded" };
+    } catch {
+      addMessage(messagesContainer, `无法读取技能文件: ${command.skillPath}`, "error");
+      return { type: "handled" };
+    }
   }
-  if (command === "clear") {
+
+  if (command.name === "help") {
+    addMessage(messagesContainer, renderSlashHelp(), "system");
+    return { type: "handled" };
+  }
+  if (command.name === "clear") {
     history.splice(1, history.length - 1);
-    return "handled";
+    addMessage(messagesContainer, "会话上下文已清空。", "system");
+    return { type: "handled" };
   }
-  if (command === "exit") {
-    return "exit";
+  if (command.name === "exit") {
+    return { type: "exit" };
   }
-  if (command === "agents") {
-    console.log(`${C_META}agents>${C_RESET} explorer（只读探索）, planner（任务拆解）, worker（局部实现）`);
-    return "handled";
+  if (command.name === "agents") {
+    addMessage(messagesContainer, "explorer（只读探索）, planner（任务拆解）, worker（局部实现）", "system");
+    return { type: "handled" };
   }
-  if (command === "tools") {
-    console.log(`${C_META}tools>${C_RESET} read, write, edit, bash, task, plan`);
-    return "handled";
+  if (command.name === "tools") {
+    addMessage(messagesContainer, "read, write, edit, bash, task, plan", "system");
+    return { type: "handled" };
   }
-  if (command === "rules") {
-    console.log(`${C_META}rules>${C_RESET} ${projectRules ? "agents.md 已加载" : "未发现 agents.md"}`);
-    return "handled";
+  if (command.name === "rules") {
+    addMessage(messagesContainer, projectRules ? "agents.md 已加载" : "未发现 agents.md", "system");
+    return { type: "handled" };
+  }
+  if (command.name === "skills") {
+    const skillCmds = slashCommands.filter((c) => c.kind === "skill");
+    if (skillCmds.length === 0) {
+      addMessage(messagesContainer, "未发现任何技能。将 SKILL.md 放入 .agents/skills/ 目录即可。", "system");
+    } else {
+      const lines = [`skills (${skillCmds.length})>`];
+      for (const s of skillCmds) {
+        lines.push(`  /${s.name.padEnd(30)} ${s.description.slice(0, 50)}`);
+      }
+      addMessage(messagesContainer, lines.join("\n"), "system");
+    }
+    return { type: "handled" };
   }
 
-  return "handled";
+  return { type: "handled" };
 }
 
 function loadProjectRules(): string {
@@ -724,6 +773,23 @@ function addMessage(container: Container, text: string, role: "user" | "assistan
   container.addChild(new Spacer(1));
 }
 
+async function displayAgentReply(reply: AgentTurnResult, messagesContainer: Container): Promise<void> {
+  if (reply.blocks.length > 0) {
+    const blocks = await Promise.all(
+      reply.blocks.map(async (b) => {
+        if (b.kind === "code") {
+          const formatted = await formatCode(b.content, b.language);
+          return ["```" + (b.language ?? ""), formatted, "```"].join("\n");
+        }
+        return b.content;
+      }),
+    );
+    addMessage(messagesContainer, blocks.join("\n\n"), "assistant");
+  } else {
+    addMessage(messagesContainer, reply.summary, "assistant");
+  }
+}
+
 async function tuiConfirm(tui: TUI, message: string): Promise<boolean> {
   return new Promise((resolve) => {
     const items: SelectItem[] = [
@@ -792,11 +858,98 @@ function formatPlanText(items: PlanItem[]): string {
   return lines.join("\n");
 }
 
+function parseSkillFrontmatter(content: string): { name: string; description: string } | null {
+  const match = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!match) return null;
+  const fm = match[1];
+  const name = fm.match(/^name:\s*(.+)$/m)?.[1]?.trim().replace(/^["']|["']$/g, "");
+  const desc = fm.match(/^description:\s*(.+)$/m)?.[1]?.trim().replace(/^["']|["']$/g, "");
+  if (!name || !desc) return null;
+  return { name, description: desc };
+}
+
+function scanSkillDir(dir: string, seen: Set<string>): SkillMeta[] {
+  const result: SkillMeta[] = [];
+  try {
+    for (const entry of readdirSync(dir)) {
+      const fullPath = join(dir, entry);
+      try {
+        const st = statSync(fullPath);
+        const targetDir = st.isDirectory() ? fullPath : null;
+        if (!targetDir) continue;
+
+        // Direct skill: targetDir/SKILL.md
+        const directMd = join(targetDir, "SKILL.md");
+        if (existsSync(directMd)) {
+          const content = readFileSync(directMd, "utf8");
+          const meta = parseSkillFrontmatter(content);
+          if (meta && !seen.has(meta.name)) {
+            seen.add(meta.name);
+            result.push({ name: meta.name, description: meta.description, path: directMd });
+          }
+          continue;
+        }
+
+        // Skill collection: targetDir/*/SKILL.md
+        for (const sub of readdirSync(targetDir)) {
+          const subMd = join(targetDir, sub, "SKILL.md");
+          if (!existsSync(subMd)) continue;
+          const content = readFileSync(subMd, "utf8");
+          const meta = parseSkillFrontmatter(content);
+          if (meta && !seen.has(meta.name)) {
+            seen.add(meta.name);
+            result.push({ name: meta.name, description: meta.description, path: subMd });
+          }
+        }
+      } catch {
+        // skip unreadable entries
+      }
+    }
+  } catch {
+    // skip unreadable directories
+  }
+  return result;
+}
+
+function discoverSkills(): SkillMeta[] {
+  const seen = new Set<string>();
+  const all: SkillMeta[] = [];
+
+  // Project skills
+  const projectDir = join(process.cwd(), ".agents", "skills");
+  if (existsSync(projectDir)) {
+    all.push(...scanSkillDir(projectDir, seen));
+  }
+
+  // Global skills
+  const globalDir = join(homedir(), ".agents", "skills");
+  if (existsSync(globalDir)) {
+    all.push(...scanSkillDir(globalDir, seen));
+  }
+
+  return all;
+}
+
+function formatSkillsPrompt(skills: SkillMeta[]): string {
+  if (skills.length === 0) return "";
+  const lines = ["<available_skills>"];
+  for (const s of skills) {
+    lines.push(`  <skill>`);
+    lines.push(`    <name>${s.name}</name>`);
+    lines.push(`    <description>${s.description}</description>`);
+    lines.push(`    <location>${s.path}</location>`);
+    lines.push(`  </skill>`);
+  }
+  lines.push("</available_skills>");
+  return lines.join("\n");
+}
+
 async function runAgentTurn(
   history: ChatMessage[],
   userInput: string,
   mode: AgentMode,
   projectRules: string,
+  skills: SkillMeta[],
   tui: TUI,
   messagesContainer: Container,
 ): Promise<AgentTurnResult> {
@@ -819,8 +972,11 @@ async function runAgentTurn(
               '{"type":"read","path":"...","reason":"..."} 或 {"type":"bash","command":"...","args":["..."],"reason":"..."} 或 {"type":"task","agent":"explorer|planner","prompt":"...","description":"..."} ' +
               '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
               "工具含义：plan声明/更新计划（你负责维护状态，客户端只展示不自动推进）；read读取文件内容；bash只允许安全只读命令；task把局部探索/计划交给独立上下文子智能体并只接收摘要。inspect 模式只能使用 explorer 或 planner 子智能体。复杂问题先发 plan 列出步骤，完成一步后重新发 plan 更新状态。禁止 write/edit。"
-            : '你是普通问答助手。你必须只返回 JSON，且只能使用 {"type":"final","answer":{"summary":"...","blocks":[...]}}。禁止返回 command、禁止建议执行命令。') +
-        formatProjectRules(projectRules),
+            : '你是普通问答助手。你必须只返回 JSON，且只能使用 {"type":"final","answer":{"summary":"...","blocks":[...]}}。禁止返回 command、禁止建议执行命令。')
+        + `\n用户可用命令：${slashCommands.filter((c) => c.kind === "builtin").map((c) => `/${c.name} ${c.description}`).join(" | ")}。当用户问「有什么命令」「功能」时，列出这些斜杠命令即可，不要展开你的内部 JSON 工具。`
+        + formatProjectRules(projectRules)
+        + "\n" + formatSkillsPrompt(skills)
+        + "\n当任务匹配某个技能描述时，先用 read 工具加载该技能的 SKILL.md 文件（见 location 字段），然后严格按技能指令执行。",
     },
     ...history,
     { role: "user", content: userInput },
@@ -879,9 +1035,13 @@ async function runAgentTurn(
     }
 
     if (action.type === "plan") {
+      const prevSnapshot = JSON.stringify(plan);
       plan = action.items;
-      addMessage(messagesContainer, formatPlanText(plan), "system");
-      tui.requestRender();
+      const nextSnapshot = JSON.stringify(plan);
+      if (prevSnapshot !== nextSnapshot) {
+        addMessage(messagesContainer, formatPlanText(plan), "system");
+        tui.requestRender();
+      }
       loopMessages.push({
         role: "user",
         content: `计划已更新:\n${plan.map((item) => `- [${item.status}] ${item.content}`).join("\n")}`,
@@ -944,6 +1104,12 @@ export async function startChat(): Promise<void> {
   return new Promise<void>((resolve) => {
     const cfg = loadConfig();
     const projectRules = loadProjectRules();
+    const skills = discoverSkills();
+
+    // Build unified slash command list (builtin + skills)
+    const buildResult = buildSlashCommands(skills);
+    slashCommands = buildResult.commands;
+    slashFuse = new Fuse(slashCommands, { keys: ["name", "aliases", "description"], threshold: 0.45, includeScore: true });
 
     const terminal = new ProcessTerminal();
     const tui = new TUI(terminal);
@@ -953,7 +1119,7 @@ export async function startChat(): Promise<void> {
 
     const editor = new Editor(tui, editorTheme, { paddingX: 1 });
     const provider = new CombinedAutocompleteProvider(
-      SLASH_COMMANDS.map((cmd) => ({ name: cmd.name, description: cmd.description })),
+      slashCommands.map((cmd) => ({ name: cmd.name, description: cmd.description })),
       process.cwd(),
     );
     editor.setAutocompleteProvider(provider);
@@ -972,6 +1138,12 @@ export async function startChat(): Promise<void> {
     ];
 
     addMessage(messagesContainer, `suncli chat (${cfg.model})`, "system");
+    if (skills.length > 0) {
+      addMessage(messagesContainer, `已加载 ${skills.length} 个技能，输入 / 可搜索。`, "system");
+    }
+    for (const w of buildResult.warnings) {
+      addMessage(messagesContainer, `⚠ ${w}`, "system");
+    }
     addMessage(messagesContainer, "输入 /help 查看命令，输入 /exit 退出。", "system");
 
     let apiKeyPromptDone = false;
@@ -1008,38 +1180,42 @@ export async function startChat(): Promise<void> {
 
       await checkApiKey();
 
-      const slashResult = await handleSlashCommand(input, history, projectRules, tui);
-      if (slashResult === "exit") {
+      const slashResult = await handleSlashCommand(input, history, projectRules, tui, messagesContainer);
+      if (slashResult.type === "exit") {
         tui.stop();
         resolve();
         return;
       }
-      if (slashResult === "handled") {
+      if (slashResult.type === "handled") {
+        tui.requestRender();
+        return;
+      }
+      if (slashResult.type === "fill_editor") {
+        editor.setText(slashResult.text);
+        tui.requestRender();
+        return;
+      }
+      if (slashResult.type === "skill_loaded") {
+        addMessage(messagesContainer, "技能已就绪，请输入你的任务。", "system");
+        tui.requestRender();
+        return;
+      }
+      if (slashResult.type === "skill_with_task") {
+        const taskMsg = [...history].reverse().find((m) => m.role === "user");
+        const task = taskMsg?.content ?? input;
+        const reply = await runAgentTurn(history, task, "write", projectRules, skills, tui, messagesContainer);
+        history.push({ role: "assistant", content: reply.summary });
+        await displayAgentReply(reply, messagesContainer);
         tui.requestRender();
         return;
       }
 
       try {
-        const reply = await runAgentTurn(history, input, "write", projectRules, tui, messagesContainer);
+        const reply = await runAgentTurn(history, input, "write", projectRules, skills, tui, messagesContainer);
 
         history.push({ role: "user", content: input });
         history.push({ role: "assistant", content: reply.summary });
-
-        if (reply.blocks.length > 0) {
-          const blocks = await Promise.all(
-            reply.blocks.map(async (b) => {
-              if (b.kind === "code") {
-                const formatted = await formatCode(b.content, b.language);
-                return ["```" + (b.language ?? ""), formatted, "```"].join("\n");
-              }
-              return b.content;
-            }),
-          );
-          const md = blocks.join("\n\n");
-          addMessage(messagesContainer, md, "assistant");
-        } else {
-          addMessage(messagesContainer, reply.summary, "assistant");
-        }
+        await displayAgentReply(reply, messagesContainer);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         addMessage(messagesContainer, msg, "error");
