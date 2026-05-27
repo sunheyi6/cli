@@ -25,6 +25,7 @@ When the user says to remember something, write the rule or preference into this
 - Default deny on risky commands.
 - Require explicit confirmation for destructive operations.
 - Keep a max step limit to avoid infinite loops.
+- During implementation changes, avoid session-breaking behavior: prefer graceful failures, return structured error messages, and keep the conversation alive instead of crashing on tool/file errors.
 
 ## Output Style
 - Be concise.
