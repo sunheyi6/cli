@@ -13,7 +13,6 @@ import {
   Text,
   Markdown,
   Editor,
-  Loader,
   Spacer,
   SelectList,
   Input,
@@ -49,24 +48,6 @@ type AgentTurnResult = {
   blocks: Array<{ kind: "text" | "code"; content: string; language?: string }>;
   steps: number;
 };
-type IntentResult = {
-  intent:
-    | "代码解释"
-    | "查看文件/架构"
-    | "查错/分析"
-    | "技术问答"
-    | "新增文件"
-    | "新增函数"
-    | "修改现有代码"
-    | "删除代码"
-    | "执行命令"
-    | "高危操作"
-    | "非项目相关";
-  confidence: number;
-  risk: "low" | "medium" | "high";
-  needsTool: boolean;
-  tools: Array<"read" | "write" | "edit" | "bash" | "task">;
-};
 type AgentMode = "answer" | "inspect" | "write";
 type PlanItem = { content: string; status: "pending" | "in_progress" | "completed" };
 type SlashCommandName = "help" | "clear" | "exit" | "agents" | "tools" | "rules";
@@ -94,22 +75,6 @@ const SLASH_FUSE = new Fuse(SLASH_COMMANDS, {
   threshold: 0.45,
   includeScore: true,
 });
-
-function advancePlanProgress(items: PlanItem[]): PlanItem[] {
-  if (items.length === 0) {
-    return items;
-  }
-  const next = items.map((item) => ({ ...item }));
-  const activeIndex = next.findIndex((item) => item.status === "in_progress");
-  if (activeIndex >= 0) {
-    next[activeIndex].status = "completed";
-  }
-  const pendingIndex = next.findIndex((item) => item.status === "pending");
-  if (pendingIndex >= 0) {
-    next[pendingIndex].status = "in_progress";
-  }
-  return next;
-}
 
 function searchSlashCommands(query: string): SlashCommandMatch[] {
   const normalized = query.trim().replace(/^\//, "").toLowerCase();
@@ -277,103 +242,104 @@ async function askDeepSeek(messages: ChatMessage[]): Promise<string> {
   }
 
   const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
+    choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
   };
 
   return data.choices?.[0]?.message?.content?.trim() || "模型没有返回内容。";
 }
 
-function classifyIntentLocally(input: string): IntentResult | null {
-  const text = input.toLowerCase();
-  const projectWords = ["这个项目", "当前项目", "本项目", "项目", "代码库", "仓库", "工程"];
-  const inspectWords = ["做什么", "什么功能", "有哪些功能", "功能", "架构", "目录", "文件", "结构"];
-  const destructiveWords = ["删除", "清空", "移除", "reset", "rm ", "del ", "drop"];
+type StreamCallbacks = {
+  onThinking?: (chunk: string, fullText: string) => void;
+  onContent?: (chunk: string, fullText: string) => void;
+};
 
-  if (destructiveWords.some((word) => text.includes(word))) {
-    return { intent: "高危操作", confidence: 0.9, risk: "high", needsTool: true, tools: ["bash"] };
+type StreamResult = {
+  reasoning: string;
+  content: string;
+};
+
+async function askDeepSeekStream(
+  messages: ChatMessage[],
+  callbacks?: StreamCallbacks,
+): Promise<StreamResult> {
+  const cfg = loadConfig();
+  const key = process.env[cfg.apiKeyEnv] ?? cfg.apiKey;
+  if (!key) {
+    const msg = `未找到 API Key，请先设置环境变量 ${cfg.apiKeyEnv}，或启动时按提示输入。`;
+    return { reasoning: "", content: msg };
   }
 
-  if (projectWords.some((word) => text.includes(word)) && inspectWords.some((word) => text.includes(word))) {
-    return { intent: "查看文件/架构", confidence: 0.95, risk: "low", needsTool: true, tools: ["read", "bash", "task"] };
-  }
-
-  if (["你是谁", "你可以做什么", "你能做什么"].some((word) => input.includes(word))) {
-    return { intent: "非项目相关", confidence: 0.95, risk: "low", needsTool: false, tools: [] };
-  }
-
-  return null;
-}
-
-async function classifyIntent(input: string, history: ChatMessage[], projectRules: string): Promise<IntentResult | null> {
-  const localIntent = classifyIntentLocally(input);
-  if (localIntent) {
-    return localIntent;
-  }
-
-  const raw = await askDeepSeek([
-    {
-      role: "system",
-      content:
-        `
-你是严格的意图分类器。
-请按照层级一步步思考，但不要输出思考过程，只输出最终JSON。
-
-层级判断规则：
-1. 是否与项目代码/文件相关？
-   不相关 → intent: 非项目相关
-2. 相关 → 判断是只读还是修改？
-   只读 → 代码解释、查看文件/架构、查错/分析、技术问答
-   修改 → 新增文件、新增函数、修改现有代码、删除代码、执行命令、高危操作
-
-可用工具：
-- read：读取文件内容（查看代码 / 配置）
-- write：新建或覆盖文件（创建新文件）
-- edit：精确局部修改（改函数、改配置）
-- bash：执行终端命令（运行、安装、git 等）
-- task：启动子智能体处理局部任务，隔离上下文，只返回摘要
-
-请判断是否需要调用工具，以及具体可能需要哪些工具：
-- 普通问答通常 needsTool=false, tools=[]
-- 查看项目、解释代码、分析错误通常 needsTool=true, tools=["read"] 或 ["read","bash"]，复杂探索可加 "task"
-- 新增文件通常 tools=["write"]
-- 修改现有代码通常 tools=["read","edit"]，必要时加 "bash"
-- 执行命令通常 tools=["bash"]
-- 删除/高危操作通常 tools=["bash"] 且 risk=high
-
-风险等级：
-low：只读、问答
-medium：新增、修改代码
-high：删除代码、高危操作、执行系统命令
-
-必须严格只输出JSON，格式：
-{"intent":"...","confidence":0.0,"risk":"low|medium|high","needsTool":true,"tools":["read"]}
-${formatProjectRules(projectRules)}
-`.trim(),
+  const response = await fetch(`${cfg.apiBaseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${key}`,
     },
-    ...history.slice(-6),
-    { role: "user", content: input },
-  ]);
-  const fenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const payload = (fenceMatch?.[1] ?? raw).trim();
-  try {
-    const parsed = JSON.parse(payload) as Partial<IntentResult>;
-    if (!parsed.intent || !parsed.risk || typeof parsed.confidence !== "number") {
-      return null;
-    }
-    return {
-      intent: parsed.intent,
-      confidence: parsed.confidence,
-      risk: parsed.risk,
-      needsTool: typeof parsed.needsTool === "boolean" ? parsed.needsTool : false,
-      tools: Array.isArray(parsed.tools)
-        ? parsed.tools.filter((tool): tool is "read" | "write" | "edit" | "bash" | "task" =>
-            ["read", "write", "edit", "bash", "task"].includes(String(tool)),
-          )
-        : [],
-    } as IntentResult;
-  } catch {
-    return null;
+    body: JSON.stringify({
+      model: cfg.model,
+      messages,
+      temperature: 0.3,
+      stream: true,
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    const msg = `请求失败: ${response.status} ${response.statusText}\n${detail}`;
+    return { reasoning: "", content: msg };
   }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    return { reasoning: "", content: "模型没有返回内容。" };
+  }
+
+  const decoder = new TextDecoder();
+  let reasoning = "";
+  let content = "";
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data: ")) continue;
+
+        const payload = trimmed.slice(6);
+        if (payload === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(payload) as {
+            choices?: Array<{
+              delta?: { content?: string; reasoning_content?: string };
+            }>;
+          };
+          const delta = parsed.choices?.[0]?.delta;
+          if (delta?.reasoning_content) {
+            reasoning += delta.reasoning_content;
+            callbacks?.onThinking?.(delta.reasoning_content, reasoning);
+          }
+          if (delta?.content) {
+            content += delta.content;
+            callbacks?.onContent?.(delta.content, content);
+          }
+        } catch {
+          // skip malformed SSE lines
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return { reasoning, content: content.trim() || "模型没有返回内容。" };
 }
 
 function parseAgentAction(raw: string): AgentAction | null {
@@ -745,13 +711,15 @@ async function formatCode(code: string, language?: string): Promise<string> {
 
 function addMessage(container: Container, text: string, role: "user" | "assistant" | "system" | "error"): void {
   if (role === "user") {
-    container.addChild(new Text(`${chalk.cyan("you>")} ${text}`, 1, 0));
+    // Divider before each user message to separate QA turns
+    container.addChild(new Text(chalk.gray("─".repeat(40)), 1, 0));
+    container.addChild(new Text(`${chalk.cyan.bold("▌")} ${text}`, 2, 0));
   } else if (role === "error") {
-    container.addChild(new Text(`${chalk.red("error>")} ${text}`, 1, 0));
+    container.addChild(new Text(`${chalk.red.bold("✖")} ${text}`, 2, 0));
   } else if (role === "system") {
     container.addChild(new Text(chalk.gray(text), 1, 0));
   } else {
-    container.addChild(new Markdown(text, 1, 0, markdownTheme));
+    container.addChild(new Markdown(text, 2, 0, markdownTheme));
   }
   container.addChild(new Spacer(1));
 }
@@ -828,11 +796,9 @@ async function runAgentTurn(
   history: ChatMessage[],
   userInput: string,
   mode: AgentMode,
-  allowedTools: IntentResult["tools"],
   projectRules: string,
   tui: TUI,
   messagesContainer: Container,
-  spinner?: Loader,
 ): Promise<AgentTurnResult> {
   const maxSteps = 100;
   let plan: PlanItem[] = [];
@@ -840,20 +806,19 @@ async function runAgentTurn(
     {
       role: "system",
       content:
-        `本轮意图识别建议工具: ${allowedTools.length ? allowedTools.join(", ") : "none"}。\n` +
         (mode === "write"
           ? '你是终端编码 Agent。你每一步必须只返回 JSON。可用格式：' +
             '{"type":"plan","items":[{"content":"...","status":"pending|in_progress|completed"}]}、' +
             '{"type":"read","path":"...","reason":"..."}、{"type":"write","path":"...","content":"...","reason":"..."}、{"type":"edit","path":"...","search":"...","replace":"...","reason":"..."}、{"type":"bash","command":"...","args":["..."],"reason":"..."} ' +
             '、{"type":"task","agent":"explorer|planner|worker","prompt":"...","description":"..."} ' +
             '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-            "工具含义：plan维护待办计划；read读取文件内容；write新建或覆盖文件；edit精确局部修改；bash执行终端命令；task启动独立上下文子智能体处理局部任务并返回摘要。内置子智能体：explorer=只读探索，planner=拆解计划，worker=局部实现。大任务先用 plan 写计划，每做完一步用 plan 更新状态。当任务完成时返回 final。不要输出 JSON 以外的内容。"
+            "工具含义：plan声明/更新计划（你负责维护状态，客户端只展示不自动推进）；read读取文件内容；write新建或覆盖文件；edit精确局部修改；bash执行终端命令；task启动独立上下文子智能体处理局部任务并返回摘要。内置子智能体：explorer=只读探索，planner=拆解计划，worker=局部实现。复杂任务先发 plan 列出步骤，完成一步后重新发 plan 将该步标记为 completed 并激活下一步。当任务完成时返回 final。不要输出 JSON 以外的内容。"
           : mode === "inspect"
             ? '你是项目只读巡检 Agent。你每一步必须只返回 JSON。可用格式：' +
               '{"type":"plan","items":[{"content":"...","status":"pending|in_progress|completed"}]}、' +
               '{"type":"read","path":"...","reason":"..."} 或 {"type":"bash","command":"...","args":["..."],"reason":"..."} 或 {"type":"task","agent":"explorer|planner","prompt":"...","description":"..."} ' +
               '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-              "工具含义：plan维护待办计划；read读取文件内容；bash只允许安全只读命令；task把局部探索/计划交给独立上下文子智能体并只接收摘要。inspect 模式只能使用 explorer 或 planner 子智能体。复杂问题先用 plan 写计划，每做完一步用 plan 更新状态。禁止 write/edit。"
+              "工具含义：plan声明/更新计划（你负责维护状态，客户端只展示不自动推进）；read读取文件内容；bash只允许安全只读命令；task把局部探索/计划交给独立上下文子智能体并只接收摘要。inspect 模式只能使用 explorer 或 planner 子智能体。复杂问题先发 plan 列出步骤，完成一步后重新发 plan 更新状态。禁止 write/edit。"
             : '你是普通问答助手。你必须只返回 JSON，且只能使用 {"type":"final","answer":{"summary":"...","blocks":[...]}}。禁止返回 command、禁止建议执行命令。') +
         formatProjectRules(projectRules),
     },
@@ -862,7 +827,36 @@ async function runAgentTurn(
   ];
 
   for (let step = 1; step <= maxSteps; step += 1) {
-    const raw = await askDeepSeek(loopMessages);
+    // Thinking display widget
+    const thinkingWidget = new Text(chalk.gray("💭 思考中..."), 1, 1);
+    messagesContainer.addChild(thinkingWidget);
+    tui.requestRender();
+
+    const streamResult = await askDeepSeekStream(loopMessages, {
+      onThinking: (_chunk, fullText) => {
+        const preview = fullText.length > 300
+          ? fullText.slice(-300)
+          : fullText;
+        thinkingWidget.setText(chalk.gray(`💭 ${preview}`));
+        tui.requestRender();
+      },
+      onContent: (_chunk, _fullText) => {
+        thinkingWidget.setText(chalk.gray("💭 ..."));
+        tui.requestRender();
+      },
+    });
+
+    messagesContainer.removeChild(thinkingWidget);
+
+    // Show reasoning summary if available
+    if (streamResult.reasoning) {
+      const preview = streamResult.reasoning.length > 500
+        ? streamResult.reasoning.slice(0, 500) + "..."
+        : streamResult.reasoning;
+      addMessage(messagesContainer, chalk.gray(`💭 ${preview}`), "system");
+    }
+
+    const raw = streamResult.content;
     const action = parseAgentAction(raw);
 
     if (!action) {
@@ -876,11 +870,6 @@ async function runAgentTurn(
     }
 
     if (action.type === "final") {
-      if (plan.some((item) => item.status !== "completed")) {
-        plan = plan.map((item) => ({ ...item, status: "completed" }));
-        addMessage(messagesContainer, formatPlanText(plan), "system");
-        tui.requestRender();
-      }
       return {
         type: "final",
         summary: action.answer.summary,
@@ -891,10 +880,8 @@ async function runAgentTurn(
 
     if (action.type === "plan") {
       plan = action.items;
-      spinner?.stop();
       addMessage(messagesContainer, formatPlanText(plan), "system");
       tui.requestRender();
-      spinner?.start();
       loopMessages.push({
         role: "user",
         content: `计划已更新:\n${plan.map((item) => `- [${item.status}] ${item.content}`).join("\n")}`,
@@ -903,14 +890,6 @@ async function runAgentTurn(
     }
 
     const display = describeTool(action);
-    if (!allowedTools.includes(action.type)) {
-      loopMessages.push({
-        role: "user",
-        content: `意图识别阶段认为本轮不应使用 ${action.type} 工具。允许工具: ${allowedTools.length ? allowedTools.join(", ") : "none"}。请改用允许工具或直接返回 final。被拒绝工具: ${display}`,
-      });
-      continue;
-    }
-
     if (mode === "answer") {
       loopMessages.push({
         role: "user",
@@ -936,9 +915,7 @@ async function runAgentTurn(
     }
 
     if (mode === "write" && action.type !== "read") {
-      spinner?.stop();
       const ok = await tuiConfirm(tui, `调用工具: ${display} ?`);
-      spinner?.start();
       if (!["y", "yes"].includes(ok ? "yes" : "no")) {
         loopMessages.push({
           role: "user",
@@ -949,21 +926,6 @@ async function runAgentTurn(
     }
 
     const result = await runTool(action, projectRules);
-    if (plan.length > 0) {
-      const updatedPlan = advancePlanProgress(plan);
-      const planChanged = JSON.stringify(updatedPlan) !== JSON.stringify(plan);
-      if (planChanged) {
-        plan = updatedPlan;
-        spinner?.stop();
-        addMessage(messagesContainer, formatPlanText(plan), "system");
-        tui.requestRender();
-        spinner?.start();
-        loopMessages.push({
-          role: "user",
-          content: `计划已自动推进:\n${plan.map((item) => `- [${item.status}] ${item.content}`).join("\n")}`,
-        });
-      }
-    }
     loopMessages.push({
       role: "user",
       content: `工具执行结果 (${display}):\n${result}`,
@@ -1034,6 +996,7 @@ export async function startChat(): Promise<void> {
       if (!input) return;
 
       editor.setText("");
+      editor.addToHistory(input);
       addMessage(messagesContainer, input, "user");
       tui.requestRender();
 
@@ -1056,40 +1019,8 @@ export async function startChat(): Promise<void> {
         return;
       }
 
-      const spinner = new Loader(tui, (s) => chalk.cyan(s), (s) => chalk.gray(s), "思考中");
-      spinner.start();
-
       try {
-        const intent = await classifyIntent(input, history, projectRules);
-        if (intent?.risk === "high" || intent?.intent === "高危操作") {
-          spinner.stop();
-          const ok = await tuiConfirm(tui, "检测到高危意图，确认继续 Agent 执行?");
-          if (!ok) {
-            addMessage(messagesContainer, "已取消本次高危请求。", "system");
-            tui.requestRender();
-            return;
-          }
-          spinner.start();
-        }
-
-        const modeByIntent: Record<IntentResult["intent"], AgentMode> = {
-          代码解释: "inspect",
-          "查看文件/架构": "inspect",
-          "查错/分析": "inspect",
-          技术问答: "answer",
-          新增文件: "write",
-          新增函数: "write",
-          修改现有代码: "write",
-          删除代码: "write",
-          执行命令: "write",
-          高危操作: "write",
-          非项目相关: "answer",
-        };
-        const mode = intent ? modeByIntent[intent.intent] : "write";
-        const allowedTools = intent?.needsTool ? intent.tools : [];
-
-        const reply = await runAgentTurn(history, input, mode, allowedTools, projectRules, tui, messagesContainer, spinner);
-        spinner.stop();
+        const reply = await runAgentTurn(history, input, "write", projectRules, tui, messagesContainer);
 
         history.push({ role: "user", content: input });
         history.push({ role: "assistant", content: reply.summary });
@@ -1110,7 +1041,6 @@ export async function startChat(): Promise<void> {
           addMessage(messagesContainer, reply.summary, "assistant");
         }
       } catch (err) {
-        spinner.stop();
         const msg = err instanceof Error ? err.message : String(err);
         addMessage(messagesContainer, msg, "error");
       }
