@@ -127,6 +127,14 @@ function resolveSlashCommandMatches(input: string): SlashCommandMatch[] {
     .sort((a, b) => b.score - a.score || a.command.name.length - b.command.name.length);
 }
 
+function isExactSlashCommand(input: string): boolean {
+  const query = input.slice(1).trim().toLowerCase();
+  if (!query) {
+    return false;
+  }
+  return SLASH_COMMANDS.some((command) => [command.name, ...command.aliases].includes(query));
+}
+
 function renderSlashHelp(): void {
   console.log(`${C_META}commands>${C_RESET}`);
   for (const command of SLASH_COMMANDS) {
@@ -138,7 +146,7 @@ async function pickSlashCommand(matches: SlashCommandMatch[]): Promise<SlashComm
   if (matches.length === 0) {
     return null;
   }
-  if (matches.length === 1 || !process.stdin.isTTY) {
+  if (!process.stdin.isTTY) {
     return matches[0].command.name;
   }
 
@@ -223,11 +231,7 @@ async function handleSlashCommand(input: string, history: ChatMessage[], project
     return "handled";
   }
 
-  const exactMatches = matches.filter((item) => item.score === 4);
-  const command =
-    exactMatches.length === 1
-      ? exactMatches[0].command.name
-      : await pickSlashCommand(matches);
+  const command = isExactSlashCommand(input) ? matches[0].command.name : await pickSlashCommand(matches);
   if (!command) {
     console.log(`${C_META}未选择命令。输入 /help 查看可用命令。${C_RESET}`);
     return "handled";
