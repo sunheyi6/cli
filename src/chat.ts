@@ -47,6 +47,10 @@ type PlanItem = { content: string; status: "pending" | "in_progress" | "complete
 type SlashCommandName = "help" | "clear" | "exit" | "agents" | "tools" | "rules";
 type SlashCommandResult = "handled" | "exit" | "not_slash";
 type SubagentName = "explorer" | "planner" | "worker";
+type SlashCommandMatch = {
+  command: { name: SlashCommandName; description: string; aliases: string[] };
+  score: number;
+};
 
 const C_RESET = "\x1b[0m";
 const C_INPUT = "\x1b[36m";
@@ -104,13 +108,13 @@ function isSubsequence(needle: string, haystack: string): boolean {
   return false;
 }
 
-function resolveSlashCommand(input: string): SlashCommandName | null {
+function resolveSlashCommandMatches(input: string): SlashCommandMatch[] {
   const query = input.slice(1).trim().toLowerCase();
   if (!query) {
-    return "help";
+    return [{ command: SLASH_COMMANDS[0], score: 4 }];
   }
 
-  const candidates = SLASH_COMMANDS.map((command) => {
+  return SLASH_COMMANDS.map((command) => {
     const terms = [command.name, ...command.aliases];
     const exact = terms.some((term) => term === query);
     const prefix = terms.some((term) => term.startsWith(query));
@@ -121,8 +125,6 @@ function resolveSlashCommand(input: string): SlashCommandName | null {
   })
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score || a.command.name.length - b.command.name.length);
-
-  return candidates[0]?.command.name ?? null;
 }
 
 function renderSlashHelp(): void {
@@ -132,14 +134,102 @@ function renderSlashHelp(): void {
   }
 }
 
-function handleSlashCommand(input: string, history: ChatMessage[], projectRules: string): SlashCommandResult {
+async function pickSlashCommand(matches: SlashCommandMatch[]): Promise<SlashCommandName | null> {
+  if (matches.length === 0) {
+    return null;
+  }
+  if (matches.length === 1 || !process.stdin.isTTY) {
+    return matches[0].command.name;
+  }
+
+  const stdin = process.stdin;
+  const wasRaw = (stdin as NodeJS.ReadStream & { isRaw?: boolean }).isRaw === true;
+  readline.emitKeypressEvents(stdin);
+  if (stdin.isTTY) {
+    stdin.setRawMode(true);
+  }
+
+  let selected = 0;
+  let renderedLines = 0;
+  const visible = matches.slice(0, 8);
+
+  const render = () => {
+    if (renderedLines > 0) {
+      readline.moveCursor(process.stdout, 0, -renderedLines);
+      readline.clearScreenDown(process.stdout);
+    }
+    const lines = [`${C_META}fuzzy> 匹配到多个命令，使用 ↑/↓ 选择，Enter 确认，Esc 取消${C_RESET}`];
+    for (let index = 0; index < visible.length; index += 1) {
+      const item = visible[index];
+      const prefix = index === selected ? `${C_OUTPUT}>${C_META}` : " ";
+      lines.push(`${C_META}${prefix} /${item.command.name} - ${item.command.description}${C_RESET}`);
+    }
+    process.stdout.write(`${lines.join("\n")}\n`);
+    renderedLines = lines.length;
+  };
+
+  const clearRender = () => {
+    if (renderedLines > 0) {
+      readline.moveCursor(process.stdout, 0, -renderedLines);
+      readline.clearScreenDown(process.stdout);
+      renderedLines = 0;
+    }
+  };
+
+  render();
+
+  return await new Promise<SlashCommandName | null>((resolve) => {
+    const cleanup = (result: SlashCommandName | null) => {
+      stdin.off("keypress", onKeypress);
+      if (stdin.isTTY) {
+        stdin.setRawMode(wasRaw);
+      }
+      clearRender();
+      resolve(result);
+    };
+
+    const onKeypress = (_str: string, key: { name?: string; ctrl?: boolean }) => {
+      if (key.name === "up") {
+        selected = selected === 0 ? visible.length - 1 : selected - 1;
+        render();
+        return;
+      }
+      if (key.name === "down") {
+        selected = selected === visible.length - 1 ? 0 : selected + 1;
+        render();
+        return;
+      }
+      if (key.name === "return" || key.name === "enter") {
+        cleanup(visible[selected].command.name);
+        return;
+      }
+      if (key.name === "escape" || (key.ctrl && key.name === "c")) {
+        cleanup(null);
+      }
+    };
+
+    stdin.on("keypress", onKeypress);
+  });
+}
+
+async function handleSlashCommand(input: string, history: ChatMessage[], projectRules: string): Promise<SlashCommandResult> {
   if (!input.startsWith("/")) {
     return "not_slash";
   }
 
-  const command = resolveSlashCommand(input);
-  if (!command) {
+  const matches = resolveSlashCommandMatches(input);
+  if (matches.length === 0) {
     console.log(`${C_META}未找到命令：${input}。输入 /help 查看可用命令。${C_RESET}`);
+    return "handled";
+  }
+
+  const exactMatches = matches.filter((item) => item.score === 4);
+  const command =
+    exactMatches.length === 1
+      ? exactMatches[0].command.name
+      : await pickSlashCommand(matches);
+  if (!command) {
+    console.log(`${C_META}未选择命令。输入 /help 查看可用命令。${C_RESET}`);
     return "handled";
   }
 
@@ -860,7 +950,7 @@ export async function startChat(): Promise<void> {
         rl.close();
         break;
       }
-      const slashResult = handleSlashCommand(input, history, projectRules);
+      const slashResult = await handleSlashCommand(input, history, projectRules);
       if (slashResult === "exit") {
         rl.close();
         break;
