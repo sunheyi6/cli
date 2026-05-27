@@ -790,42 +790,6 @@ async function displayAgentReply(reply: AgentTurnResult, messagesContainer: Cont
   }
 }
 
-async function tuiConfirm(tui: TUI, message: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const items: SelectItem[] = [
-      { value: "yes", label: "Yes", description: "确认执行" },
-      { value: "no", label: "No", description: "取消" },
-    ];
-    const theme: SelectListTheme = {
-      selectedPrefix: (s) => chalk.green(s),
-      selectedText: (s) => chalk.green(s),
-      description: (s) => chalk.gray(s),
-      scrollInfo: (s) => chalk.gray(s),
-      noMatch: (s) => chalk.red(s),
-    };
-    const list = new SelectList(items, 2, theme);
-    const container = new Container();
-    container.addChild(new Text(message, 1, 1));
-    container.addChild(list);
-
-    const handle = tui.showOverlay(container, {
-      anchor: "center",
-      width: Math.min(60, tui.terminal.columns),
-    });
-
-    list.onSelect = (item) => {
-      handle.hide();
-      resolve(item.value === "yes");
-    };
-    list.onCancel = () => {
-      handle.hide();
-      resolve(false);
-    };
-
-    handle.focus();
-  });
-}
-
 async function tuiInput(tui: TUI, message: string): Promise<string> {
   return new Promise((resolve) => {
     const container = new Container();
@@ -953,30 +917,35 @@ async function runAgentTurn(
   tui: TUI,
   messagesContainer: Container,
 ): Promise<AgentTurnResult> {
-  const maxSteps = 100;
+  const maxSteps = 500;
   let plan: PlanItem[] = [];
+
+  const toolsPrompt = [
+    "你是 suncli，终端编程助手。工作目录: " + process.cwd() + "。每一步只返回一个 JSON action：",
+    "",
+    `read   {"type":"read","path":"..."}`,
+    `write  {"type":"write","path":"...","content":"..."}`,
+    `edit   {"type":"edit","path":"...","search":"...","replace":"..."}`,
+    `bash   {"type":"bash","command":"...","args":[...]}`,
+    `task   {"type":"task","agent":"explorer|planner|worker","prompt":"..."}`,
+    `plan   {"type":"plan","items":[{"content":"...","status":"pending|in_progress|completed"}]}`,
+    `final  {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text|code","content":"..."}]}}`,
+  ].join("\n");
+
+  const modeHint = mode === "answer"
+    ? "\n当前为问答模式，只允许 final。"
+    : mode === "inspect"
+    ? "\n当前为只读模式，禁止 write/edit。"
+    : "";
+
   const loopMessages: ChatMessage[] = [
     {
       role: "system",
       content:
-        (mode === "write"
-          ? '你是终端编码 Agent。你每一步必须只返回 JSON。可用格式：' +
-            '{"type":"plan","items":[{"content":"...","status":"pending|in_progress|completed"}]}、' +
-            '{"type":"read","path":"...","reason":"..."}、{"type":"write","path":"...","content":"...","reason":"..."}、{"type":"edit","path":"...","search":"...","replace":"...","reason":"..."}、{"type":"bash","command":"...","args":["..."],"reason":"..."} ' +
-            '、{"type":"task","agent":"explorer|planner|worker","prompt":"...","description":"..."} ' +
-            '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-            "工具含义：plan声明/更新计划（你负责维护状态，客户端只展示不自动推进）；read读取文件内容；write新建或覆盖文件；edit精确局部修改；bash执行终端命令；task启动独立上下文子智能体处理局部任务并返回摘要。内置子智能体：explorer=只读探索，planner=拆解计划，worker=局部实现。复杂任务先发 plan 列出步骤，完成一步后重新发 plan 将该步标记为 completed 并激活下一步。当任务完成时返回 final。不要输出 JSON 以外的内容。"
-          : mode === "inspect"
-            ? '你是项目只读巡检 Agent。你每一步必须只返回 JSON。可用格式：' +
-              '{"type":"plan","items":[{"content":"...","status":"pending|in_progress|completed"}]}、' +
-              '{"type":"read","path":"...","reason":"..."} 或 {"type":"bash","command":"...","args":["..."],"reason":"..."} 或 {"type":"task","agent":"explorer|planner","prompt":"...","description":"..."} ' +
-              '或 {"type":"final","answer":{"summary":"...","blocks":[{"kind":"text","content":"..."},{"kind":"code","language":"ts","content":"..."}]}}。' +
-              "工具含义：plan声明/更新计划（你负责维护状态，客户端只展示不自动推进）；read读取文件内容；bash只允许安全只读命令；task把局部探索/计划交给独立上下文子智能体并只接收摘要。inspect 模式只能使用 explorer 或 planner 子智能体。复杂问题先发 plan 列出步骤，完成一步后重新发 plan 更新状态。禁止 write/edit。"
-            : '你是普通问答助手。你必须只返回 JSON，且只能使用 {"type":"final","answer":{"summary":"...","blocks":[...]}}。禁止返回 command、禁止建议执行命令。')
-        + `\n用户可用命令：${slashCommands.filter((c) => c.kind === "builtin").map((c) => `/${c.name} ${c.description}`).join(" | ")}。当用户问「有什么命令」「功能」时，列出这些斜杠命令即可，不要展开你的内部 JSON 工具。`
+        toolsPrompt
+        + modeHint
         + formatProjectRules(projectRules)
-        + "\n" + formatSkillsPrompt(skills)
-        + "\n当任务匹配某个技能描述时，先用 read 工具加载该技能的 SKILL.md 文件（见 location 字段），然后严格按技能指令执行。",
+        + "\n" + formatSkillsPrompt(skills),
     },
     ...history,
     { role: "user", content: userInput },
@@ -990,13 +959,11 @@ async function runAgentTurn(
 
     const streamResult = await askDeepSeekStream(loopMessages, {
       onThinking: (_chunk, fullText) => {
-        const preview = fullText.length > 300
-          ? fullText.slice(-300)
-          : fullText;
+        const preview = fullText.length > 200 ? "..." + fullText.slice(-200) : fullText;
         thinkingWidget.setText(chalk.gray(`💭 ${preview}`));
         tui.requestRender();
       },
-      onContent: (_chunk, _fullText) => {
+      onContent: () => {
         thinkingWidget.setText(chalk.gray("💭 ..."));
         tui.requestRender();
       },
@@ -1004,10 +971,9 @@ async function runAgentTurn(
 
     messagesContainer.removeChild(thinkingWidget);
 
-    // Show reasoning summary if available
     if (streamResult.reasoning) {
-      const preview = streamResult.reasoning.length > 500
-        ? streamResult.reasoning.slice(0, 500) + "..."
+      const preview = streamResult.reasoning.length > 400
+        ? streamResult.reasoning.slice(0, 400) + "..."
         : streamResult.reasoning;
       addMessage(messagesContainer, chalk.gray(`💭 ${preview}`), "system");
     }
@@ -1074,17 +1040,6 @@ async function runAgentTurn(
       continue;
     }
 
-    if (mode === "write" && action.type !== "read") {
-      const ok = await tuiConfirm(tui, `调用工具: ${display} ?`);
-      if (!["y", "yes"].includes(ok ? "yes" : "no")) {
-        loopMessages.push({
-          role: "user",
-          content: `命令被用户拒绝: ${display}`,
-        });
-        continue;
-      }
-    }
-
     const result = await runTool(action, projectRules);
     loopMessages.push({
       role: "user",
@@ -1133,7 +1088,7 @@ export async function startChat(): Promise<void> {
     const history: ChatMessage[] = [
       {
         role: "system",
-        content: "You are a helpful coding assistant in terminal. Keep answers concise and actionable.",
+        content: "你是 suncli，一个终端编程助手。你的工作是帮助用户阅读代码、编写修改文件、执行命令、分析项目。你直接回答用户问题，不主动探索环境。回答简洁可操作。",
       },
     ];
 
