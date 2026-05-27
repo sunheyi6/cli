@@ -1,7 +1,7 @@
 {
   "name": "suncli1",
   "version": "0.1.0",
-  "description": "Minimal TypeScript CLI demo",
+  "description": "Terminal-native TypeScript coding agent with skills, streaming, and sub-agents",
   "type": "module",
   "bin": {
     "suncli-ts": "dist/index.js",
