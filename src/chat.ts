@@ -44,6 +44,8 @@ type IntentResult = {
 };
 type AgentMode = "answer" | "inspect" | "write";
 type PlanItem = { content: string; status: "pending" | "in_progress" | "completed" };
+type SlashCommandName = "help" | "clear" | "exit" | "agents" | "tools" | "rules";
+type SlashCommandResult = "handled" | "exit" | "not_slash";
 type SubagentName = "explorer" | "planner" | "worker";
 
 const C_RESET = "\x1b[0m";
@@ -60,6 +62,95 @@ function renderPlan(items: PlanItem[]): void {
     const mark = item.status === "completed" ? "x" : item.status === "in_progress" ? ">" : " ";
     console.log(`${C_META}- [${mark}] ${item.content}${C_RESET}`);
   }
+}
+
+const SLASH_COMMANDS: Array<{ name: SlashCommandName; description: string; aliases: string[] }> = [
+  { name: "help", description: "显示可用斜杠命令", aliases: ["h", "?"] },
+  { name: "clear", description: "清空当前会话上下文", aliases: ["cls", "reset"] },
+  { name: "exit", description: "退出会话", aliases: ["quit", "q"] },
+  { name: "agents", description: "查看内置子智能体", aliases: ["agent", "subagents"] },
+  { name: "tools", description: "查看可用工具", aliases: ["tool"] },
+  { name: "rules", description: "查看 agents.md 是否已加载", aliases: ["rule"] },
+];
+
+function isSubsequence(needle: string, haystack: string): boolean {
+  let cursor = 0;
+  for (const char of haystack) {
+    if (char === needle[cursor]) {
+      cursor += 1;
+    }
+    if (cursor === needle.length) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveSlashCommand(input: string): SlashCommandName | null {
+  const query = input.slice(1).trim().toLowerCase();
+  if (!query) {
+    return "help";
+  }
+
+  const candidates = SLASH_COMMANDS.map((command) => {
+    const terms = [command.name, ...command.aliases];
+    const exact = terms.some((term) => term === query);
+    const prefix = terms.some((term) => term.startsWith(query));
+    const contains = terms.some((term) => term.includes(query));
+    const subsequence = terms.some((term) => isSubsequence(query, term));
+    const score = exact ? 4 : prefix ? 3 : contains ? 2 : subsequence ? 1 : 0;
+    return { command, score };
+  })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.command.name.length - b.command.name.length);
+
+  return candidates[0]?.command.name ?? null;
+}
+
+function renderSlashHelp(): void {
+  console.log(`${C_META}commands>${C_RESET}`);
+  for (const command of SLASH_COMMANDS) {
+    console.log(`${C_META}/${command.name.padEnd(9)} ${command.description}${C_RESET}`);
+  }
+}
+
+function handleSlashCommand(input: string, history: ChatMessage[], projectRules: string): SlashCommandResult {
+  if (!input.startsWith("/")) {
+    return "not_slash";
+  }
+
+  const command = resolveSlashCommand(input);
+  if (!command) {
+    console.log(`${C_META}未找到命令：${input}。输入 /help 查看可用命令。${C_RESET}`);
+    return "handled";
+  }
+
+  if (command === "help") {
+    renderSlashHelp();
+    return "handled";
+  }
+  if (command === "clear") {
+    history.splice(1, history.length - 1);
+    console.log(`${C_META}已清空会话上下文。${C_RESET}`);
+    return "handled";
+  }
+  if (command === "exit") {
+    return "exit";
+  }
+  if (command === "agents") {
+    console.log(`${C_META}agents>${C_RESET} explorer（只读探索）, planner（任务拆解）, worker（局部实现）`);
+    return "handled";
+  }
+  if (command === "tools") {
+    console.log(`${C_META}tools>${C_RESET} read, write, edit, bash, task, plan`);
+    return "handled";
+  }
+  if (command === "rules") {
+    console.log(`${C_META}rules>${C_RESET} ${projectRules ? "agents.md 已加载" : "未发现 agents.md"}`);
+    return "handled";
+  }
+
+  return "handled";
 }
 
 function loadProjectRules(): string {
@@ -673,7 +764,7 @@ export async function startChat(): Promise<void> {
   const cfg = loadConfig();
   const projectRules = loadProjectRules();
   console.log(`suncli chat (${cfg.model})`);
-  console.log("输入 exit 或 /exit 退出，输入 /help 查看可用命令。");
+  console.log("输入 /help 查看命令，输入 /exit 退出。");
 
   const history: ChatMessage[] = [
     {
@@ -708,17 +799,16 @@ export async function startChat(): Promise<void> {
 
   while (true) {
     const input = await askLine(rl, `${C_INPUT}you> ${C_RESET}`);
-      if (input === "/exit" || input === "exit") {
+      if (input === "exit") {
         rl.close();
         break;
       }
-      if (input === "/help") {
-        console.log("可用命令: /help, /exit, exit, /clear");
-        continue;
+      const slashResult = handleSlashCommand(input, history, projectRules);
+      if (slashResult === "exit") {
+        rl.close();
+        break;
       }
-      if (input === "/clear") {
-        history.splice(1, history.length - 1);
-        console.log("已清空会话上下文。");
+      if (slashResult === "handled") {
         continue;
       }
       const spinner = createSpinner();
