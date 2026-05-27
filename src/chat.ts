@@ -1,9 +1,33 @@
-import readline from "node:readline";
+#!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import Fuse from "fuse.js";
-import { loadConfig, saveConfig } from "./config.js";
+import chalk from "chalk";
+import * as prettier from "prettier";
+import prettierPluginJava from "prettier-plugin-java";
+import {
+  TUI,
+  ProcessTerminal,
+  Container,
+  Text,
+  Markdown,
+  Editor,
+  Loader,
+  Spacer,
+  SelectList,
+  Input,
+  matchesKey,
+  Key,
+  truncateToWidth,
+  CombinedAutocompleteProvider,
+  type Component,
+  type EditorTheme,
+  type MarkdownTheme,
+  type SelectListTheme,
+  type SelectItem,
+} from "@mariozechner/pi-tui";
+import { getConfigPath, loadConfig, saveConfig } from "./config.js";
 
 type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -57,17 +81,19 @@ const C_OUTPUT = "\x1b[32m";
 const C_META = "\x1b[90m";
 const C_DONE = "\x1b[32m";
 
-function renderPlan(items: PlanItem[]): void {
-  if (items.length === 0) {
-    return;
-  }
-  console.log(`${C_META}plan>${C_RESET}`);
-  for (const item of items) {
-    const mark = item.status === "completed" ? "x" : item.status === "in_progress" ? ">" : " ";
-    const markColor = item.status === "completed" ? C_DONE : C_META;
-    console.log(`${C_META}- [${markColor}${mark}${C_META}] ${item.content}${C_RESET}`);
-  }
-}
+const SLASH_COMMANDS: SlashCommand[] = [
+  { name: "help", description: "显示可用斜杠命令", aliases: ["h", "?"] },
+  { name: "clear", description: "清空当前会话上下文", aliases: ["cls", "reset"] },
+  { name: "exit", description: "退出会话", aliases: ["quit", "q"] },
+  { name: "agents", description: "查看内置子智能体", aliases: ["agent", "subagents"] },
+  { name: "tools", description: "查看可用工具", aliases: ["tool"] },
+  { name: "rules", description: "查看 agents.md 是否已加载", aliases: ["rule"] },
+];
+const SLASH_FUSE = new Fuse(SLASH_COMMANDS, {
+  keys: ["name", "aliases", "description"],
+  threshold: 0.45,
+  includeScore: true,
+});
 
 function advancePlanProgress(items: PlanItem[]): PlanItem[] {
   if (items.length === 0) {
@@ -84,20 +110,6 @@ function advancePlanProgress(items: PlanItem[]): PlanItem[] {
   }
   return next;
 }
-
-const SLASH_COMMANDS: SlashCommand[] = [
-  { name: "help", description: "显示可用斜杠命令", aliases: ["h", "?"] },
-  { name: "clear", description: "清空当前会话上下文", aliases: ["cls", "reset"] },
-  { name: "exit", description: "退出会话", aliases: ["quit", "q"] },
-  { name: "agents", description: "查看内置子智能体", aliases: ["agent", "subagents"] },
-  { name: "tools", description: "查看可用工具", aliases: ["tool"] },
-  { name: "rules", description: "查看 agents.md 是否已加载", aliases: ["rule"] },
-];
-const SLASH_FUSE = new Fuse(SLASH_COMMANDS, {
-  keys: ["name", "aliases", "description"],
-  threshold: 0.45,
-  includeScore: true,
-});
 
 function searchSlashCommands(query: string): SlashCommandMatch[] {
   const normalized = query.trim().replace(/^\//, "").toLowerCase();
@@ -127,106 +139,60 @@ function findExactSlashCommand(input: string): SlashCommandName | null {
   return null;
 }
 
-function renderSlashHelp(): void {
-  console.log(`${C_META}commands>${C_RESET}`);
+function renderSlashHelp(): string {
+  const lines: string[] = [`${C_META}commands>${C_RESET}`];
   for (const command of SLASH_COMMANDS) {
-    console.log(`${C_META}/${command.name.padEnd(9)} ${command.description}${C_RESET}`);
+    lines.push(`${C_META}/${command.name.padEnd(9)} ${command.description}${C_RESET}`);
   }
+  return lines.join("\n");
 }
 
-async function pickSlashCommand(matches: SlashCommandMatch[], rl?: readline.Interface): Promise<SlashCommandName | null> {
+async function pickSlashCommandTui(tui: TUI, matches: SlashCommandMatch[]): Promise<SlashCommandName | null> {
   if (matches.length === 0) {
     return null;
   }
 
-  if (!process.stdin.isTTY || !rl) {
-    return matches[0].command.name;
-  }
+  const visible = matches.slice(0, 8);
+  const items: SelectItem[] = visible.map((m) => ({
+    value: m.command.name,
+    label: `/${m.command.name}`,
+    description: m.command.description,
+  }));
+
+  const theme: SelectListTheme = {
+    selectedPrefix: (s) => chalk.cyan(s),
+    selectedText: (s) => chalk.cyan(s),
+    description: (s) => chalk.gray(s),
+    scrollInfo: (s) => chalk.gray(s),
+    noMatch: (s) => chalk.red(s),
+  };
 
   return new Promise((resolve) => {
-    const stdin = process.stdin;
-    const stdout = process.stdout;
-    const visible = matches.slice(0, 8);
-    const wasRaw = (stdin as NodeJS.ReadStream & { isRaw?: boolean }).isRaw === true;
-    let selected = 0;
-    let renderedLines = 0;
-    let originalTtyWrite: unknown;
-    let capturedTtyWrite = false;
+    const list = new SelectList(items, visible.length, theme);
+    const handle = tui.showOverlay(list, {
+      anchor: "center",
+      width: Math.min(50, tui.terminal.columns),
+    });
 
-    const clear = () => {
-      if (renderedLines > 0) {
-        readline.moveCursor(stdout, 0, -renderedLines);
-        readline.clearScreenDown(stdout);
-        renderedLines = 0;
-      }
+    list.onSelect = (item) => {
+      handle.hide();
+      resolve(item.value as SlashCommandName);
+    };
+    list.onCancel = () => {
+      handle.hide();
+      resolve(null);
     };
 
-    const restore = () => {
-      stdin.off("keypress", onKeypress);
-      if (stdin.isTTY) {
-        stdin.setRawMode(wasRaw);
-      }
-      if (capturedTtyWrite) {
-        (rl as unknown as { _ttyWrite?: unknown })._ttyWrite = originalTtyWrite;
-      }
-      rl.resume();
-    };
-
-    const finish = (command: SlashCommandName | null) => {
-      clear();
-      restore();
-      resolve(command);
-    };
-
-    const render = () => {
-      clear();
-      const lines = [`${C_META}fuzzy> ↑/↓ 选择，Enter 确认，Esc 取消${C_RESET}`];
-      for (let index = 0; index < visible.length; index += 1) {
-        const item = visible[index];
-        const marker = index === selected ? ">" : " ";
-        const color = index === selected ? C_OUTPUT : C_META;
-        lines.push(`${color}${marker} /${item.command.name} - ${item.command.description}${C_RESET}`);
-      }
-      stdout.write(`${lines.join("\n")}\n`);
-      renderedLines = lines.length;
-    };
-
-    const onKeypress = (_str: string, key: { name?: string; ctrl?: boolean }) => {
-      if (key?.ctrl && key.name === "c") {
-        finish("exit");
-        return;
-      }
-      if (key.name === "escape") {
-        finish(null);
-        return;
-      }
-      if (key.name === "up") {
-        selected = selected === 0 ? visible.length - 1 : selected - 1;
-        render();
-        return;
-      }
-      if (key.name === "down") {
-        selected = selected === visible.length - 1 ? 0 : selected + 1;
-        render();
-        return;
-      }
-      if (key.name === "return" || key.name === "enter") {
-        finish(visible[selected].command.name);
-      }
-    };
-
-    rl.pause();
-    originalTtyWrite = (rl as unknown as { _ttyWrite?: unknown })._ttyWrite;
-    capturedTtyWrite = true;
-    (rl as unknown as { _ttyWrite?: unknown })._ttyWrite = () => undefined;
-    readline.emitKeypressEvents(stdin);
-    stdin.setRawMode(true);
-    stdin.on("keypress", onKeypress);
-    render();
+    handle.focus();
   });
 }
 
-async function handleSlashCommand(input: string, history: ChatMessage[], projectRules: string, rl?: readline.Interface): Promise<SlashCommandResult> {
+async function handleSlashCommand(
+  input: string,
+  history: ChatMessage[],
+  projectRules: string,
+  tui: TUI,
+): Promise<SlashCommandResult> {
   if (!input.startsWith("/")) {
     return "not_slash";
   }
@@ -234,23 +200,20 @@ async function handleSlashCommand(input: string, history: ChatMessage[], project
   const exactCommand = findExactSlashCommand(input);
   const matches = searchSlashCommands(input);
   if (matches.length === 0) {
-    console.log(`${C_META}未找到命令：${input}。输入 /help 查看可用命令。${C_RESET}`);
     return "handled";
   }
 
-  const command = exactCommand ?? (await pickSlashCommand(matches, rl));
+  const command = exactCommand ?? (await pickSlashCommandTui(tui, matches));
   if (!command) {
-    console.log(`${C_META}未选择命令。输入 /help 查看可用命令。${C_RESET}`);
     return "handled";
   }
 
   if (command === "help") {
-    renderSlashHelp();
+    console.log(renderSlashHelp());
     return "handled";
   }
   if (command === "clear") {
     history.splice(1, history.length - 1);
-    console.log(`${C_META}已清空会话上下文。${C_RESET}`);
     return "handled";
   }
   if (command === "exit") {
@@ -318,54 +281,6 @@ async function askDeepSeek(messages: ChatMessage[]): Promise<string> {
   };
 
   return data.choices?.[0]?.message?.content?.trim() || "模型没有返回内容。";
-}
-
-function askLine(rl: readline.Interface, prompt: string): Promise<string> {
-  return new Promise((resolve) => rl.question(prompt, (line: string) => resolve(line.trim())));
-}
-
-function askUserInput(rl: readline.Interface): Promise<string> {
-  return askLine(rl, `${C_INPUT}you> ${C_RESET}`);
-}
-
-function startSpinner(text = "思考中"): () => void {
-  if (!process.stdout.isTTY) {
-    return () => undefined;
-  }
-
-  const frames = ["-", "\\", "|", "/"];
-  let index = 0;
-  const timer = setInterval(() => {
-    process.stdout.write(`\r${C_META}${frames[index % frames.length]} ${text}${C_RESET}`);
-    index += 1;
-  }, 120);
-
-  return () => {
-    clearInterval(timer);
-    process.stdout.write("\r\x1b[2K");
-  };
-}
-
-function createSpinner(text = "思考中"): { stop: () => void; restart: () => void } {
-  let stopCurrent = startSpinner(text);
-  let active = true;
-
-  return {
-    stop: () => {
-      if (!active) {
-        return;
-      }
-      stopCurrent();
-      active = false;
-    },
-    restart: () => {
-      if (active) {
-        return;
-      }
-      stopCurrent = startSpinner(text);
-      active = true;
-    },
-  };
 }
 
 function classifyIntentLocally(input: string): IntentResult | null {
@@ -755,16 +670,171 @@ function runCommand(command: string, args: string[]): Promise<string> {
   });
 }
 
+// TUI helpers
+
+const editorTheme: EditorTheme = {
+  borderColor: (s) => chalk.gray(s),
+  selectList: {
+    selectedPrefix: (s) => chalk.cyan(s),
+    selectedText: (s) => chalk.cyan(s),
+    description: (s) => chalk.gray(s),
+    scrollInfo: (s) => chalk.gray(s),
+    noMatch: (s) => chalk.red(s),
+  },
+};
+
+const markdownTheme: MarkdownTheme = {
+  heading: (s) => chalk.bold.cyan(s),
+  link: (s) => chalk.underline.blue(s),
+  linkUrl: (s) => chalk.blue(s),
+  code: (s) => chalk.yellow(s),
+  codeBlock: (s) => chalk.gray(s),
+  codeBlockBorder: (s) => chalk.gray(s),
+  quote: (s) => chalk.italic.gray(s),
+  quoteBorder: (s) => chalk.gray(s),
+  hr: (s) => chalk.gray(s),
+  listBullet: (s) => chalk.cyan(s),
+  bold: (s) => chalk.bold(s),
+  italic: (s) => chalk.italic(s),
+  strikethrough: (s) => chalk.strikethrough(s),
+  underline: (s) => chalk.underline(s),
+};
+
+async function formatCode(code: string, language?: string): Promise<string> {
+  const parserMap: Record<string, { parser: string; plugins?: prettier.Plugin[] }> = {
+    ts: { parser: "typescript" },
+    tsx: { parser: "typescript" },
+    typescript: { parser: "typescript" },
+    js: { parser: "babel" },
+    jsx: { parser: "babel" },
+    javascript: { parser: "babel" },
+    json: { parser: "json" },
+    json5: { parser: "json5" },
+    css: { parser: "css" },
+    scss: { parser: "scss" },
+    less: { parser: "less" },
+    html: { parser: "html" },
+    vue: { parser: "vue" },
+    angular: { parser: "angular" },
+    markdown: { parser: "markdown" },
+    md: { parser: "markdown" },
+    mdx: { parser: "mdx" },
+    yaml: { parser: "yaml" },
+    yml: { parser: "yaml" },
+    graphql: { parser: "graphql" },
+    gql: { parser: "graphql" },
+    java: { parser: "java", plugins: [prettierPluginJava] },
+  };
+
+  const entry = language ? parserMap[language.toLowerCase()] : undefined;
+  if (!entry) {
+    return code;
+  }
+
+  try {
+    return await prettier.format(code, {
+      parser: entry.parser,
+      plugins: entry.plugins,
+      printWidth: 100,
+      tabWidth: 2,
+    });
+  } catch {
+    return code;
+  }
+}
+
+function addMessage(container: Container, text: string, role: "user" | "assistant" | "system" | "error"): void {
+  if (role === "user") {
+    container.addChild(new Text(`${chalk.cyan("you>")} ${text}`, 1, 0));
+  } else if (role === "error") {
+    container.addChild(new Text(`${chalk.red("error>")} ${text}`, 1, 0));
+  } else if (role === "system") {
+    container.addChild(new Text(chalk.gray(text), 1, 0));
+  } else {
+    container.addChild(new Markdown(text, 1, 0, markdownTheme));
+  }
+  container.addChild(new Spacer(1));
+}
+
+async function tuiConfirm(tui: TUI, message: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const items: SelectItem[] = [
+      { value: "yes", label: "Yes", description: "确认执行" },
+      { value: "no", label: "No", description: "取消" },
+    ];
+    const theme: SelectListTheme = {
+      selectedPrefix: (s) => chalk.green(s),
+      selectedText: (s) => chalk.green(s),
+      description: (s) => chalk.gray(s),
+      scrollInfo: (s) => chalk.gray(s),
+      noMatch: (s) => chalk.red(s),
+    };
+    const list = new SelectList(items, 2, theme);
+    const container = new Container();
+    container.addChild(new Text(message, 1, 1));
+    container.addChild(list);
+
+    const handle = tui.showOverlay(container, {
+      anchor: "center",
+      width: Math.min(60, tui.terminal.columns),
+    });
+
+    list.onSelect = (item) => {
+      handle.hide();
+      resolve(item.value === "yes");
+    };
+    list.onCancel = () => {
+      handle.hide();
+      resolve(false);
+    };
+
+    handle.focus();
+  });
+}
+
+async function tuiInput(tui: TUI, message: string): Promise<string> {
+  return new Promise((resolve) => {
+    const container = new Container();
+    container.addChild(new Text(message, 1, 1));
+
+    const input = new Input();
+    container.addChild(input);
+
+    const handle = tui.showOverlay(container, {
+      anchor: "center",
+      width: Math.min(60, tui.terminal.columns),
+    });
+
+    input.onSubmit = (value) => {
+      handle.hide();
+      resolve(value);
+    };
+
+    handle.focus();
+  });
+}
+
+function formatPlanText(items: PlanItem[]): string {
+  if (items.length === 0) return "";
+  const lines = ["plan>"];
+  for (const item of items) {
+    const mark = item.status === "completed" ? "x" : item.status === "in_progress" ? ">" : " ";
+    lines.push(`- [${mark}] ${item.content}`);
+  }
+  return lines.join("\n");
+}
+
 async function runAgentTurn(
-  rl: readline.Interface,
   history: ChatMessage[],
   userInput: string,
   mode: AgentMode,
   allowedTools: IntentResult["tools"],
   projectRules: string,
-  spinner?: { stop: () => void; restart: () => void },
+  tui: TUI,
+  messagesContainer: Container,
+  spinner?: Loader,
 ): Promise<AgentTurnResult> {
-  const maxSteps = 8;
+  const maxSteps = 100;
   let plan: PlanItem[] = [];
   const loopMessages: ChatMessage[] = [
     {
@@ -808,7 +878,8 @@ async function runAgentTurn(
     if (action.type === "final") {
       if (plan.some((item) => item.status !== "completed")) {
         plan = plan.map((item) => ({ ...item, status: "completed" }));
-        renderPlan(plan);
+        addMessage(messagesContainer, formatPlanText(plan), "system");
+        tui.requestRender();
       }
       return {
         type: "final",
@@ -821,8 +892,9 @@ async function runAgentTurn(
     if (action.type === "plan") {
       plan = action.items;
       spinner?.stop();
-      renderPlan(plan);
-      spinner?.restart();
+      addMessage(messagesContainer, formatPlanText(plan), "system");
+      tui.requestRender();
+      spinner?.start();
       loopMessages.push({
         role: "user",
         content: `计划已更新:\n${plan.map((item) => `- [${item.status}] ${item.content}`).join("\n")}`,
@@ -865,9 +937,9 @@ async function runAgentTurn(
 
     if (mode === "write" && action.type !== "read") {
       spinner?.stop();
-      const confirm = await askLine(rl, `调用工具: ${display} ? [y/N] `);
-      spinner?.restart();
-      if (!["y", "yes"].includes(confirm.toLowerCase())) {
+      const ok = await tuiConfirm(tui, `调用工具: ${display} ?`);
+      spinner?.start();
+      if (!["y", "yes"].includes(ok ? "yes" : "no")) {
         loopMessages.push({
           role: "user",
           content: `命令被用户拒绝: ${display}`,
@@ -883,8 +955,9 @@ async function runAgentTurn(
       if (planChanged) {
         plan = updatedPlan;
         spinner?.stop();
-        renderPlan(plan);
-        spinner?.restart();
+        addMessage(messagesContainer, formatPlanText(plan), "system");
+        tui.requestRender();
+        spinner?.start();
         loopMessages.push({
           role: "user",
           content: `计划已自动推进:\n${plan.map((item) => `- [${item.status}] ${item.content}`).join("\n")}`,
@@ -905,89 +978,100 @@ async function runAgentTurn(
   };
 }
 
-function renderFinal(result: AgentTurnResult): void {
-  console.log(`${C_META}${process.cwd()}>${C_RESET} ${C_OUTPUT}${result.summary}`);
-  for (const block of result.blocks) {
-    if (block.kind === "text") {
-      console.log(block.content);
-      continue;
-    }
-    if (block.kind === "code") {
-      const lang = block.language ?? "code";
-      console.log(`${C_META}--- ${lang} ---${C_RESET}`);
-      console.log(block.content);
-      console.log(`${C_META}-------------${C_RESET}`);
-    }
-  }
-  process.stdout.write(C_RESET);
-}
-
 export async function startChat(): Promise<void> {
-  const cfg = loadConfig();
-  const projectRules = loadProjectRules();
-  console.log(`suncli chat (${cfg.model})`);
-  console.log("输入 /help 查看命令，输入 /exit 退出。");
+  return new Promise<void>((resolve) => {
+    const cfg = loadConfig();
+    const projectRules = loadProjectRules();
 
-  const history: ChatMessage[] = [
-    {
-      role: "system",
-      content:
-        "You are a helpful coding assistant in terminal. Keep answers concise and actionable.",
-    },
-  ];
+    const terminal = new ProcessTerminal();
+    const tui = new TUI(terminal);
 
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    terminal: true,
-  });
+    const messagesContainer = new Container();
+    tui.addChild(messagesContainer);
 
-  const existingKey = process.env[cfg.apiKeyEnv] ?? cfg.apiKey;
-  if (!existingKey) {
-    await new Promise<void>((resolve) => {
-      console.log("未检测到 API Key。推荐使用 DeepSeek API Key。");
-      rl.question("请输入 API Key（直接回车可跳过）: ", (line: string) => {
-        const key = line.trim();
+    const editor = new Editor(tui, editorTheme, { paddingX: 1 });
+    const provider = new CombinedAutocompleteProvider(
+      SLASH_COMMANDS.map((cmd) => ({ name: cmd.name, description: cmd.description })),
+      process.cwd(),
+    );
+    editor.setAutocompleteProvider(provider);
+
+    const inputOverlay = tui.showOverlay(editor, {
+      anchor: "bottom-center",
+      width: "100%",
+      offsetY: 0,
+    });
+
+    const history: ChatMessage[] = [
+      {
+        role: "system",
+        content: "You are a helpful coding assistant in terminal. Keep answers concise and actionable.",
+      },
+    ];
+
+    addMessage(messagesContainer, `suncli chat (${cfg.model})`, "system");
+    addMessage(messagesContainer, "输入 /help 查看命令，输入 /exit 退出。", "system");
+
+    let apiKeyPromptDone = false;
+
+    async function checkApiKey(): Promise<void> {
+      const existingKey = process.env[cfg.apiKeyEnv] ?? cfg.apiKey;
+      if (!existingKey && !apiKeyPromptDone) {
+        apiKeyPromptDone = true;
+        const key = await tuiInput(tui, `未检测到 API Key。推荐使用 DeepSeek API Key。\n请输入 API Key（直接回车可跳过）:`);
         if (key) {
           saveConfig({ apiKey: key });
-          console.log("API Key 已保存到本地配置。");
+          addMessage(messagesContainer, "API Key 已保存到本地配置。", "system");
         } else {
-          console.log(`你也可以稍后设置环境变量 ${cfg.apiKeyEnv}。`);
+          addMessage(messagesContainer, `你也可以稍后设置环境变量 ${cfg.apiKeyEnv}。`, "system");
         }
-        resolve();
-      });
-    });
-  }
-
-  while (true) {
-    const input = await askUserInput(rl);
-      if (input === "exit") {
-        rl.close();
-        break;
+        tui.requestRender();
       }
-      const slashResult = await handleSlashCommand(input, history, projectRules, rl);
+    }
+
+    editor.onSubmit = async (text) => {
+      const input = text.trim();
+      if (!input) return;
+
+      editor.setText("");
+      addMessage(messagesContainer, input, "user");
+      tui.requestRender();
+
+      if (input === "exit") {
+        tui.stop();
+        resolve();
+        return;
+      }
+
+      await checkApiKey();
+
+      const slashResult = await handleSlashCommand(input, history, projectRules, tui);
       if (slashResult === "exit") {
-        rl.close();
-        break;
+        tui.stop();
+        resolve();
+        return;
       }
       if (slashResult === "handled") {
-        continue;
+        tui.requestRender();
+        return;
       }
-      const spinner = createSpinner();
 
-      let intent: IntentResult | null = null;
-      let reply: AgentTurnResult | null = null;
+      const spinner = new Loader(tui, (s) => chalk.cyan(s), (s) => chalk.gray(s), "思考中");
+      spinner.start();
+
       try {
-        intent = await classifyIntent(input, history, projectRules);
+        const intent = await classifyIntent(input, history, projectRules);
         if (intent?.risk === "high" || intent?.intent === "高危操作") {
           spinner.stop();
-          const ok = await askLine(rl, `${C_META}检测到高危意图，确认继续 Agent 执行? [y/N] ${C_RESET}`);
-          if (!["y", "yes"].includes(ok.toLowerCase())) {
-            console.log(`${C_OUTPUT}${process.cwd()}> 已取消本次高危请求。${C_RESET}`);
-            continue;
+          const ok = await tuiConfirm(tui, "检测到高危意图，确认继续 Agent 执行?");
+          if (!ok) {
+            addMessage(messagesContainer, "已取消本次高危请求。", "system");
+            tui.requestRender();
+            return;
           }
-          spinner.restart();
+          spinner.start();
         }
+
         const modeByIntent: Record<IntentResult["intent"], AgentMode> = {
           代码解释: "inspect",
           "查看文件/架构": "inspect",
@@ -1003,22 +1087,47 @@ export async function startChat(): Promise<void> {
         };
         const mode = intent ? modeByIntent[intent.intent] : "write";
         const allowedTools = intent?.needsTool ? intent.tools : [];
-        reply = await runAgentTurn(rl, history, input, mode, allowedTools, projectRules, spinner);
-      } finally {
-        spinner.stop();
-      }
-      if (!reply) {
-        continue;
-      }
-      history.push({ role: "user", content: input });
-      history.push({ role: "assistant", content: reply.summary });
-      renderFinal(reply);
-  }
 
-  await new Promise<void>((resolve) => {
-    rl.on("close", () => {
-      console.log("bye.");
-      resolve();
+        const reply = await runAgentTurn(history, input, mode, allowedTools, projectRules, tui, messagesContainer, spinner);
+        spinner.stop();
+
+        history.push({ role: "user", content: input });
+        history.push({ role: "assistant", content: reply.summary });
+
+        if (reply.blocks.length > 0) {
+          const blocks = await Promise.all(
+            reply.blocks.map(async (b) => {
+              if (b.kind === "code") {
+                const formatted = await formatCode(b.content, b.language);
+                return ["```" + (b.language ?? ""), formatted, "```"].join("\n");
+              }
+              return b.content;
+            }),
+          );
+          const md = blocks.join("\n\n");
+          addMessage(messagesContainer, md, "assistant");
+        } else {
+          addMessage(messagesContainer, reply.summary, "assistant");
+        }
+      } catch (err) {
+        spinner.stop();
+        const msg = err instanceof Error ? err.message : String(err);
+        addMessage(messagesContainer, msg, "error");
+      }
+
+      tui.requestRender();
+    };
+
+    tui.addInputListener((data) => {
+      if (matchesKey(data, Key.ctrl("c"))) {
+        tui.stop();
+        resolve();
+        return { consume: true };
+      }
+      return undefined;
     });
+
+    tui.setFocus(editor);
+    tui.start();
   });
 }

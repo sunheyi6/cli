@@ -4,7 +4,8 @@
   "description": "Minimal TypeScript CLI demo",
   "type": "module",
   "bin": {
-    "suncli-ts": "dist/index.js"
+    "suncli-ts": "dist/index.js",
+    "cli": "dist/index.js"
   },
   "scripts": {
     "dev": "tsx src/index.ts",
@@ -15,8 +16,11 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@mariozechner/pi-tui": "^0.73.0",
     "commander": "^14.0.3",
-    "fuse.js": "^7.3.0"
+    "fuse.js": "^7.3.0",
+    "prettier": "^3.8.3",
+    "prettier-plugin-java": "^2.9.6"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
