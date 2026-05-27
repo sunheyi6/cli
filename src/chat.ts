@@ -99,38 +99,6 @@ const SLASH_FUSE = new Fuse(SLASH_COMMANDS, {
   includeScore: true,
 });
 
-function isSubsequence(needle: string, haystack: string): boolean {
-  let cursor = 0;
-  for (const char of haystack) {
-    if (char === needle[cursor]) {
-      cursor += 1;
-    }
-    if (cursor === needle.length) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function resolveSlashCommandMatches(input: string): SlashCommandMatch[] {
-  const query = input.slice(1).trim().toLowerCase();
-  if (!query) {
-    return [{ command: SLASH_COMMANDS[0], score: 4 }];
-  }
-
-  return SLASH_COMMANDS.map((command) => {
-    const terms = [command.name, ...command.aliases];
-    const exact = terms.some((term) => term === query);
-    const prefix = terms.some((term) => term.startsWith(query));
-    const contains = terms.some((term) => term.includes(query));
-    const subsequence = terms.some((term) => isSubsequence(query, term));
-    const score = exact ? 4 : prefix ? 3 : contains ? 2 : subsequence ? 1 : 0;
-    return { command, score };
-  })
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score || a.command.name.length - b.command.name.length);
-}
-
 function searchSlashCommands(query: string): SlashCommandMatch[] {
   const normalized = query.trim().replace(/^\//, "").toLowerCase();
   if (!normalized) {
@@ -144,6 +112,21 @@ function searchSlashCommands(query: string): SlashCommandMatch[] {
     .sort((a, b) => b.score - a.score || a.command.name.length - b.command.name.length);
 }
 
+function findExactSlashCommand(input: string): SlashCommandName | null {
+  const query = input.slice(1).trim().toLowerCase();
+  if (!query) {
+    return null;
+  }
+
+  for (const command of SLASH_COMMANDS) {
+    if ([command.name, ...command.aliases].includes(query)) {
+      return command.name;
+    }
+  }
+
+  return null;
+}
+
 function renderSlashHelp(): void {
   console.log(`${C_META}commands>${C_RESET}`);
   for (const command of SLASH_COMMANDS) {
@@ -151,18 +134,111 @@ function renderSlashHelp(): void {
   }
 }
 
+async function pickSlashCommand(matches: SlashCommandMatch[], rl?: readline.Interface): Promise<SlashCommandName | null> {
+  if (matches.length === 0) {
+    return null;
+  }
+
+  if (!process.stdin.isTTY || !rl) {
+    return matches[0].command.name;
+  }
+
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    const stdout = process.stdout;
+    const visible = matches.slice(0, 8);
+    const wasRaw = (stdin as NodeJS.ReadStream & { isRaw?: boolean }).isRaw === true;
+    let selected = 0;
+    let renderedLines = 0;
+    let originalTtyWrite: unknown;
+    let capturedTtyWrite = false;
+
+    const clear = () => {
+      if (renderedLines > 0) {
+        readline.moveCursor(stdout, 0, -renderedLines);
+        readline.clearScreenDown(stdout);
+        renderedLines = 0;
+      }
+    };
+
+    const restore = () => {
+      stdin.off("keypress", onKeypress);
+      if (stdin.isTTY) {
+        stdin.setRawMode(wasRaw);
+      }
+      if (capturedTtyWrite) {
+        (rl as unknown as { _ttyWrite?: unknown })._ttyWrite = originalTtyWrite;
+      }
+      rl.resume();
+    };
+
+    const finish = (command: SlashCommandName | null) => {
+      clear();
+      restore();
+      resolve(command);
+    };
+
+    const render = () => {
+      clear();
+      const lines = [`${C_META}fuzzy> ↑/↓ 选择，Enter 确认，Esc 取消${C_RESET}`];
+      for (let index = 0; index < visible.length; index += 1) {
+        const item = visible[index];
+        const marker = index === selected ? ">" : " ";
+        const color = index === selected ? C_OUTPUT : C_META;
+        lines.push(`${color}${marker} /${item.command.name} - ${item.command.description}${C_RESET}`);
+      }
+      stdout.write(`${lines.join("\n")}\n`);
+      renderedLines = lines.length;
+    };
+
+    const onKeypress = (_str: string, key: { name?: string; ctrl?: boolean }) => {
+      if (key?.ctrl && key.name === "c") {
+        finish("exit");
+        return;
+      }
+      if (key.name === "escape") {
+        finish(null);
+        return;
+      }
+      if (key.name === "up") {
+        selected = selected === 0 ? visible.length - 1 : selected - 1;
+        render();
+        return;
+      }
+      if (key.name === "down") {
+        selected = selected === visible.length - 1 ? 0 : selected + 1;
+        render();
+        return;
+      }
+      if (key.name === "return" || key.name === "enter") {
+        finish(visible[selected].command.name);
+      }
+    };
+
+    rl.pause();
+    originalTtyWrite = (rl as unknown as { _ttyWrite?: unknown })._ttyWrite;
+    capturedTtyWrite = true;
+    (rl as unknown as { _ttyWrite?: unknown })._ttyWrite = () => undefined;
+    readline.emitKeypressEvents(stdin);
+    stdin.setRawMode(true);
+    stdin.on("keypress", onKeypress);
+    render();
+  });
+}
+
 async function handleSlashCommand(input: string, history: ChatMessage[], projectRules: string, rl?: readline.Interface): Promise<SlashCommandResult> {
   if (!input.startsWith("/")) {
     return "not_slash";
   }
 
-  const matches = resolveSlashCommandMatches(input);
+  const exactCommand = findExactSlashCommand(input);
+  const matches = searchSlashCommands(input);
   if (matches.length === 0) {
     console.log(`${C_META}未找到命令：${input}。输入 /help 查看可用命令。${C_RESET}`);
     return "handled";
   }
 
-  const command = matches[0].command.name;
+  const command = exactCommand ?? (await pickSlashCommand(matches, rl));
   if (!command) {
     console.log(`${C_META}未选择命令。输入 /help 查看可用命令。${C_RESET}`);
     return "handled";
@@ -249,130 +325,7 @@ function askLine(rl: readline.Interface, prompt: string): Promise<string> {
 }
 
 function askUserInput(rl: readline.Interface): Promise<string> {
-  if (!process.stdin.isTTY) {
-    return askLine(rl, `${C_INPUT}you> ${C_RESET}`);
-  }
-
-  return new Promise((resolve) => {
-    const stdin = process.stdin;
-    const wasRaw = (stdin as NodeJS.ReadStream & { isRaw?: boolean }).isRaw === true;
-    let input = "";
-    let selected = 0;
-    let slashMode = false;
-    let renderedLines = 0;
-    let originalTtyWrite: unknown;
-
-    const restoreRl = () => {
-      if (originalTtyWrite) {
-        (rl as unknown as { _ttyWrite?: unknown })._ttyWrite = originalTtyWrite;
-      }
-      rl.resume();
-    };
-
-    const cleanup = (result: string) => {
-      stdin.off("keypress", onKeypress);
-      if (stdin.isTTY) {
-        stdin.setRawMode(wasRaw);
-      }
-      clearSuggestions();
-      restoreRl();
-      process.stdout.write("\n");
-      resolve(result.trim());
-    };
-
-    const clearSuggestions = () => {
-      if (renderedLines > 0) {
-        readline.moveCursor(process.stdout, 0, -renderedLines);
-        readline.clearScreenDown(process.stdout);
-        renderedLines = 0;
-      }
-    };
-
-    const matches = () => searchSlashCommands(input.slice(1)).slice(0, 8);
-
-    const render = () => {
-      clearSuggestions();
-      readline.cursorTo(process.stdout, 0);
-      readline.clearLine(process.stdout, 0);
-      process.stdout.write(`${C_INPUT}you> ${C_RESET}${input}`);
-      if (!slashMode) {
-        return;
-      }
-      const visible = matches();
-      const lines = [`${C_META}fuzzy> 输入命令，↑/↓ 选择，Enter 确认，Esc 取消${C_RESET}`];
-      for (let index = 0; index < visible.length; index += 1) {
-        const item = visible[index];
-        const prefix = index === selected ? `${C_OUTPUT}>${C_META}` : " ";
-        lines.push(`${C_META}${prefix} /${item.command.name} - ${item.command.description}${C_RESET}`);
-      }
-      process.stdout.write(`\n${lines.join("\n")}`);
-      renderedLines = lines.length;
-    };
-
-    const commitSlashSelection = () => {
-      const visible = matches();
-      if (visible.length > 0) {
-        cleanup(`/${visible[Math.min(selected, visible.length - 1)].command.name}`);
-        return;
-      }
-      cleanup(input);
-    };
-
-    const onKeypress = (str: string, key: { name?: string; ctrl?: boolean }) => {
-      if (key?.ctrl && key.name === "c") {
-        cleanup("/exit");
-        return;
-      }
-      if (slashMode && key.name === "escape") {
-        input = "";
-        slashMode = false;
-        selected = 0;
-        render();
-        return;
-      }
-      if (slashMode && key.name === "up") {
-        const count = Math.max(matches().length, 1);
-        selected = selected === 0 ? count - 1 : selected - 1;
-        render();
-        return;
-      }
-      if (slashMode && key.name === "down") {
-        const count = Math.max(matches().length, 1);
-        selected = selected === count - 1 ? 0 : selected + 1;
-        render();
-        return;
-      }
-      if (key.name === "return" || key.name === "enter") {
-        if (slashMode) {
-          commitSlashSelection();
-          return;
-        }
-        cleanup(input);
-        return;
-      }
-      if (key.name === "backspace") {
-        input = input.slice(0, -1);
-        slashMode = input.startsWith("/");
-        selected = 0;
-        render();
-        return;
-      }
-      if (str && str >= " " && str !== "\u007f") {
-        input += str;
-        slashMode = input.startsWith("/");
-        selected = 0;
-        render();
-      }
-    };
-
-    rl.pause();
-    originalTtyWrite = (rl as unknown as { _ttyWrite?: unknown })._ttyWrite;
-    (rl as unknown as { _ttyWrite?: unknown })._ttyWrite = () => undefined;
-    readline.emitKeypressEvents(stdin);
-    stdin.setRawMode(true);
-    process.stdout.write(`${C_INPUT}you> ${C_RESET}`);
-    stdin.on("keypress", onKeypress);
-  });
+  return askLine(rl, `${C_INPUT}you> ${C_RESET}`);
 }
 
 function startSpinner(text = "思考中"): () => void {
